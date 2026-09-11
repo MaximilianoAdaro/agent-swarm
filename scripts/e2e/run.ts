@@ -21,6 +21,7 @@ import { configRoundtrip } from "./scenarios/config-roundtrip";
 import { health } from "./scenarios/health";
 import { mcpSurface } from "./scenarios/mcp-surface";
 import { realtimeRooms } from "./scenarios/realtime-rooms";
+import { slackAssistantFileShare } from "./scenarios/slack-assistant-file-share";
 import { slackDelegationChildResult } from "./scenarios/slack-delegation-child-result";
 import { slackDelegationFailedChild } from "./scenarios/slack-delegation-failed-child";
 import { slackDelegationFlagOffRepro } from "./scenarios/slack-delegation-flag-off-repro";
@@ -60,6 +61,7 @@ const scenarios: Scenario[] = [
   slackMention,
   slackFollowUp,
   slackFailedTask,
+  slackAssistantFileShare,
   slackReactionOverride,
   slackRelayRestart,
   // Flag-off negative control: SLACK_RENDER_V2 on, SLACK_RENDER_V2_DELEGATION
