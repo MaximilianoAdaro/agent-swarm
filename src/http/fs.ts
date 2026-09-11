@@ -1,17 +1,11 @@
-import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import {
-  deleteTaskAttachment,
-  getAgentById,
-  getTaskAttachments,
-  getTaskById,
-  insertTaskAttachment,
-} from "../be/db";
+import { deleteTaskAttachment, getAgentById, getTaskAttachments, getTaskById } from "../be/db";
 import {
   ensureAgentFsCredentialsForAgent,
   inviteEmailToSharedOrg,
 } from "../be/seed/agent-fs-provision";
+import { MAX_TASK_ATTACHMENT_BYTES, recordTaskAttachmentUpload } from "../be/task-attachment-store";
 import { type FileObject, type FileScope, FilesError, normalizeFilesError } from "../fs/provider";
 import { getFileStorageProvider } from "../fs/registry";
 import { can, type RbacPrincipal, type RbacResource } from "../rbac";
@@ -22,7 +16,7 @@ import { scrubSecrets } from "../utils/secret-scrubber";
 import { route } from "./route-def";
 import { BODY_TOO_LARGE, enforceContentLengthCap, jsonError } from "./utils";
 
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = MAX_TASK_ATTACHMENT_BYTES;
 
 // Upload wall-clock past which the provider round-trip is worth a log line.
 // Attachment stalls were invisible before: this path had no timing at all.
@@ -380,44 +374,20 @@ async function sendUpload(
     return sendProviderError(res, error);
   }
 
-  try {
-    const auth = getCurrentRequestAuth();
-    const attachment = await insertTaskAttachment({
-      taskId,
-      agentId,
-      name: query.name,
-      kind: provider.id === "agent-fs" ? "agent-fs" : "shared-fs",
-      path: uploaded.key,
-      providerId: provider.id,
-      providerKey: uploaded.key,
-      capabilities: {
-        ...provider.capabilities,
-        version: uploaded.version,
-        etag: uploaded.etag,
-      },
-      mimeType: uploaded.contentType ?? contentType,
-      sizeBytes: uploaded.sizeBytes ?? body.byteLength,
-      sha256: uploaded.sha256 ?? createHash("sha256").update(body).digest("hex"),
-      intent: query.intent,
-      description: query.description,
-      isPrimary: query.isPrimary === "true",
-      createdBy: auth?.kind === "user" ? auth.userId : undefined,
-    });
-    uploadTaskFileRoute.respond(res, 201, attachment);
-  } catch (error) {
-    try {
-      await provider.delete(scope);
-    } catch (cleanupError) {
-      console.warn(
-        scrubSecrets(
-          `[fs] upload metadata insert failed and blob cleanup failed: ${
-            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-          }`,
-        ),
-      );
-    }
-    throw error;
-  }
+  const auth = getCurrentRequestAuth();
+  const attachment = await recordTaskAttachmentUpload({
+    provider,
+    scope,
+    uploaded,
+    body,
+    contentType,
+    agentId,
+    intent: query.intent,
+    description: query.description,
+    isPrimary: query.isPrimary === "true",
+    createdBy: auth?.kind === "user" ? auth.userId : undefined,
+  });
+  uploadTaskFileRoute.respond(res, 201, attachment);
   return true;
 }
 
