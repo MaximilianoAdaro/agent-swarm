@@ -1,5 +1,6 @@
 /**
- * Files a user shares with the bot on Slack, turned into task attachments.
+ * Slack files turned into task attachments: the ones a user shares with the
+ * bot, and the ones an agent fetches with `slack-download-file` / `slack-read`.
  *
  * The API downloads each file with the bot token, stores it through the active
  * file provider and records a `task_attachments` row, so the worker gets the
@@ -12,12 +13,12 @@
  * written, so it shows up only in the reply and in the missing attachment.
  */
 import type { WebClient } from "@slack/web-api";
-import { promoteDraftTask } from "../be/db";
+import { getTaskAttachments, getTaskById, promoteDraftTask } from "../be/db";
 import { MAX_TASK_ATTACHMENT_BYTES, recordTaskAttachmentUpload } from "../be/task-attachment-store";
 import { getFileStorageProvider } from "../fs/registry";
 import { resolveTemplate } from "../prompts/resolver";
 import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
-import type { AgentTask, CreateTaskOptions } from "../types";
+import type { AgentTask, CreateTaskOptions, TaskAttachment } from "../types";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { getFileInfo, type SlackFile } from "./files";
 // Side-effect import: registers all Slack event templates in the in-memory registry
@@ -28,6 +29,8 @@ const ATTACHMENT_INTENT = "user-upload";
 const BUFFERED_REASON = "follow-ups queued by ADDITIVE_SLACK carry the file name only";
 
 export type SlackFileFailure = { file: SlackFile; reason: string };
+
+export type AttachedSlackFile = { file: SlackFile; attachment: TaskAttachment };
 
 export type InboundSlackFiles = {
   /** Every file on the message, with full metadata (resolved via `files.info` when the event omitted it). */
@@ -183,40 +186,81 @@ export async function createSlackTaskWithFiles(
   const task = await createTaskWithSiblingAwareness(description, { ...options, status: "draft" });
   const unattached = [...inbound.failed];
   try {
-    const provider = getFileStorageProvider();
-    const usedNames = new Set<string>();
-    for (const { file, body } of inbound.fetched) {
-      // Pasted screenshots are all called "image.png"; the provider key is
-      // derived from the name, so a repeat would overwrite the first one.
-      const name = usedNames.has(file.name) ? `${file.id}-${file.name}` : file.name;
-      usedNames.add(name);
-      const scope = { taskId: task.id, name };
-      try {
-        const uploaded = await provider.upload(scope, body, {
-          contentType: file.mimetype,
-          sizeBytes: body.byteLength,
-          message: `Upload ${name} shared on Slack for task ${task.id}`,
-        });
-        await recordTaskAttachmentUpload({
-          provider,
-          scope,
-          uploaded,
-          body,
-          contentType: file.mimetype,
-          agentId: null,
-          intent: ATTACHMENT_INTENT,
-          description: `Shared on Slack (file ${file.id})`,
-        });
-      } catch (error) {
-        const reason = `could not be stored (${errorText(error)})`;
-        console.warn(`[Slack] file ${file.id} for task ${task.id} ${reason}`);
-        unattached.push({ file, reason });
-      }
-    }
+    unattached.push(...(await attachSlackFilesToTask(task.id, inbound.fetched, null)).unattached);
   } finally {
     await promoteDraftTask(task.id);
   }
   return { task, unattached };
+}
+
+/**
+ * Store fetched Slack files as attachments of an existing task. A file whose
+ * bytes the task already holds is reused instead of uploaded again. A name
+ * another attachment already uses gets the Slack file id as a prefix: the
+ * provider key is derived from the name, and pasted screenshots are all called
+ * "image.png", so a repeat would overwrite the first blob.
+ */
+export async function attachSlackFilesToTask(
+  taskId: string,
+  fetched: InboundSlackFiles["fetched"],
+  agentId: string | null,
+): Promise<{ attached: AttachedSlackFile[]; unattached: SlackFileFailure[] }> {
+  const existing = await getTaskAttachments(taskId);
+  const bySha = new Map(existing.flatMap((a) => (a.sha256 ? [[a.sha256, a] as const] : [])));
+  const usedNames = new Set(existing.map((a) => a.name));
+  const provider = getFileStorageProvider();
+  const attached: AttachedSlackFile[] = [];
+  const unattached: SlackFileFailure[] = [];
+
+  for (const { file, body } of fetched) {
+    const sha256 = new Bun.CryptoHasher("sha256").update(body).digest("hex");
+    const known = bySha.get(sha256);
+    if (known) {
+      attached.push({ file, attachment: known });
+      continue;
+    }
+    const name = usedNames.has(file.name) ? `${file.id}-${file.name}` : file.name;
+    usedNames.add(name);
+    const scope = { taskId, name };
+    try {
+      const uploaded = await provider.upload(scope, body, {
+        contentType: file.mimetype,
+        sizeBytes: body.byteLength,
+        message: `Upload ${name} shared on Slack for task ${taskId}`,
+      });
+      const attachment = await recordTaskAttachmentUpload({
+        provider,
+        scope,
+        uploaded: { ...uploaded, sha256: uploaded.sha256 ?? sha256 },
+        body,
+        contentType: file.mimetype,
+        agentId,
+        intent: ATTACHMENT_INTENT,
+        description: `Shared on Slack (file ${file.id})`,
+      });
+      bySha.set(sha256, attachment);
+      attached.push({ file, attachment });
+    } catch (error) {
+      const reason = `could not be stored (${errorText(error)})`;
+      console.warn(`[Slack] file ${file.id} for task ${taskId} ${reason}`);
+      unattached.push({ file, reason });
+    }
+  }
+  return { attached, unattached };
+}
+
+/**
+ * The task a Slack file tool may attach files to: `taskId` if the calling
+ * agent owns or created it, `null` otherwise (or when there is no task).
+ */
+export async function attachableTask(
+  agentId: string,
+  taskId: string | undefined,
+): Promise<AgentTask | null> {
+  if (!taskId) return null;
+  const task = await getTaskById(taskId);
+  if (!task) return null;
+  return task.agentId === agentId || task.creatorAgentId === agentId ? task : null;
 }
 
 /**

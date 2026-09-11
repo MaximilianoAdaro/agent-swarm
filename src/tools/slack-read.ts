@@ -4,13 +4,16 @@ import { getAgentById, getInboxMessageById, getTaskById } from "@/be/db";
 import { can } from "@/rbac";
 import { getSlackApp } from "@/slack/app";
 import { withAutoJoin } from "@/slack/channel-join";
-import { downloadFile } from "@/slack/files";
+import { downloadFile, type SlackFile } from "@/slack/files";
+import { attachableTask, attachSlackFilesToTask, fetchSlackFiles } from "@/slack/inbound-files";
 import { extractSlackMessageText } from "@/slack/message-text";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
+import { taskAttachmentFetchCommand } from "@/utils/task-attachment-links";
 
 /**
- * Default download directory for auto-downloaded Slack files (inside MCP container).
- * This differs from the agent's /workspace/shared path as the MCP server runs in a separate container.
+ * Where files are auto-downloaded when there is no task to attach them to.
+ * This is the API server's disk: a worker container only sees it if the
+ * deployment mounts the shared volume there.
  */
 const AUTO_DOWNLOAD_DIR = "/app/shared/downloads/slack";
 
@@ -21,6 +24,9 @@ const SlackFileSchema = z.looseObject({
   filetype: z.string().optional(),
   size: z.number().optional(),
   url_private_download: z.string().optional(),
+  attachmentId: z.string().optional(),
+  fetchCommand: z.string().optional(),
+  notAttached: z.string().optional(),
   localPath: z.string().optional(),
 });
 
@@ -39,7 +45,7 @@ export const registerSlackReadTool = (server: McpServer) => {
     {
       title: "Read Slack thread/channel history",
       description:
-        "Read messages from a Slack thread or channel. Use inboxMessageId or taskId to read from a thread you have context for, or provide channelId directly for channel history (leads only).",
+        "Read messages from a Slack thread or channel. Use inboxMessageId or taskId to read from a thread you have context for, or provide channelId directly for channel history (leads only). From a task, files in the messages are stored as attachments of that task, each with a ready-to-run `fetchCommand`.",
       annotations: { readOnlyHint: true, openWorldHint: true },
 
       inputSchema: z.object({
@@ -63,7 +69,9 @@ export const registerSlackReadTool = (server: McpServer) => {
         includeFiles: z
           .boolean()
           .default(true)
-          .describe("Include file attachments in the response (default: true)."),
+          .describe(
+            "Include file attachments in the response (default: true). From a task, they are also stored as attachments of that task.",
+          ),
       }),
       outputSchema: swarmToolOutputSchema({
         channelId: z.string().optional(),
@@ -209,6 +217,23 @@ export const registerSlackReadTool = (server: McpServer) => {
         // Get token for auto-download
         const token = process.env.SLACK_BOT_TOKEN;
 
+        // Files go to the calling task's attachments; without one, to the API disk.
+        const attachTo = await attachableTask(agent.id, taskId ?? requestInfo.sourceTaskId);
+
+        type FileInfo = {
+          id: string;
+          name: string;
+          mimetype: string;
+          filetype: string;
+          size: number;
+          url_private_download: string;
+          attachmentId?: string;
+          fetchCommand?: string;
+          notAttached?: string;
+          localPath?: string;
+        };
+        const toAttach: Array<{ raw: RawFile; info: FileInfo }> = [];
+
         // Format messages
         const messages: Array<{
           user: string | undefined;
@@ -216,15 +241,7 @@ export const registerSlackReadTool = (server: McpServer) => {
           isBot: boolean;
           text: string;
           ts: string;
-          files?: Array<{
-            id: string;
-            name: string;
-            mimetype: string;
-            filetype: string;
-            size: number;
-            url_private_download: string;
-            localPath?: string;
-          }>;
+          files?: FileInfo[];
         }> = [];
 
         for (const m of rawMessages) {
@@ -243,22 +260,12 @@ export const registerSlackReadTool = (server: McpServer) => {
           }
 
           // Extract file information if includeFiles is true
-          let files:
-            | Array<{
-                id: string;
-                name: string;
-                mimetype: string;
-                filetype: string;
-                size: number;
-                url_private_download: string;
-                localPath?: string;
-              }>
-            | undefined;
+          let files: FileInfo[] | undefined;
 
           if (includeFiles && m.files && m.files.length > 0) {
             files = [];
             for (const f of m.files) {
-              const fileInfo: (typeof files)[number] = {
+              const fileInfo: FileInfo = {
                 id: f.id,
                 name: f.name,
                 mimetype: f.mimetype,
@@ -267,8 +274,10 @@ export const registerSlackReadTool = (server: McpServer) => {
                 url_private_download: f.url_private_download,
               };
 
-              // Auto-download file if token is available
-              if (token && f.url_private_download) {
+              if (attachTo) {
+                toAttach.push({ raw: f, info: fileInfo });
+              } else if (token && f.url_private_download) {
+                // Auto-download file if token is available
                 const savePath = `${AUTO_DOWNLOAD_DIR}/${f.id}_${f.name}`;
                 try {
                   const downloadResult = await downloadFile({
@@ -298,6 +307,35 @@ export const registerSlackReadTool = (server: McpServer) => {
           });
         }
 
+        if (attachTo && toAttach.length > 0) {
+          const inbound = await fetchSlackFiles(
+            client,
+            toAttach.map(({ raw }) => raw as SlackFile),
+          );
+          const { attached, unattached } = await attachSlackFilesToTask(
+            attachTo.id,
+            inbound.fetched,
+            agent.id,
+          );
+          const attachmentsById = new Map(attached.map((a) => [a.file.id, a.attachment]));
+          const reasonsById = new Map(
+            [...inbound.failed, ...unattached].map((f) => [f.file.id, f.reason]),
+          );
+          for (const { info } of toAttach) {
+            const attachment = attachmentsById.get(info.id);
+            if (attachment) {
+              info.attachmentId = attachment.id;
+              info.fetchCommand = taskAttachmentFetchCommand(
+                attachTo.id,
+                attachment.id,
+                attachment.name,
+              );
+            } else {
+              info.notAttached = reasonsById.get(info.id) ?? "not downloaded";
+            }
+          }
+        }
+
         // Format for text output
         const textOutput = messages
           .map((m) => {
@@ -306,8 +344,12 @@ export const registerSlackReadTool = (server: McpServer) => {
               const fileList = m.files
                 .map((f) => {
                   let line = `  - ${f.name} (${f.mimetype}, ${Math.round(f.size / 1024)} KB)`;
-                  if (f.localPath) {
-                    line += ` [Downloaded: ${f.localPath}]`;
+                  if (f.fetchCommand) {
+                    line += ` [Task attachment ${f.attachmentId}: ${f.fetchCommand}]`;
+                  } else if (f.notAttached) {
+                    line += ` [Not attached: ${f.notAttached}]`;
+                  } else if (f.localPath) {
+                    line += ` [Downloaded on the API server, not in your container: ${f.localPath}]`;
                   }
                   return line;
                 })
