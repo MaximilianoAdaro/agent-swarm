@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -16,6 +16,7 @@ import {
 } from "../http/db-query";
 import { executeReadOnlyQueryBounded, isReportableTimeout } from "../http/db-query-bounded";
 import {
+  executeReadOnlyQuery,
   getDbQueryConcurrencyCap,
   getDbQueryHttpBudgetMs,
   getDbQueryHttpMaxRows,
@@ -52,6 +53,33 @@ describe("db-query input compatibility", () => {
 
     expect(parsed.success).toBe(false);
   });
+});
+
+test("in-memory fallback queries a read-only snapshot", () => {
+  closeDb();
+  const db = initDb(":memory:");
+  try {
+    db.run("CREATE TABLE snapshot_guard (id INTEGER PRIMARY KEY)");
+    db.run("INSERT INTO snapshot_guard VALUES (1)");
+    expect(executeReadOnlyQuery("SELECT id FROM snapshot_guard").rows).toEqual([[1]]);
+    expect(() =>
+      executeReadOnlyQuery("INSERT INTO snapshot_guard VALUES (2) RETURNING id"),
+    ).toThrow(/readonly/i);
+    expect(() => executeReadOnlyQuery("UPDATE snapshot_guard SET id = 2 RETURNING id")).toThrow(
+      /readonly/i,
+    );
+    expect(() => executeReadOnlyQuery("DELETE FROM snapshot_guard RETURNING id")).toThrow(
+      /readonly/i,
+    );
+    expect(db.query("SELECT id FROM snapshot_guard").all()).toEqual([{ id: 1 }]);
+    db.run("INSERT INTO snapshot_guard VALUES (2)");
+    expect(executeReadOnlyQuery("SELECT id FROM snapshot_guard ORDER BY id", [], 1)).toMatchObject({
+      rows: [[1]],
+      total: 2,
+    });
+  } finally {
+    closeDb();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -485,6 +513,16 @@ describe("db-query bounded execution (Fix 1)", () => {
       const result = await executeReadOnlyQueryBounded("SELECT 1 AS one", [], 5000);
       expect(result.rows).toEqual([[1]]);
       expect(result.total).toBe(1);
+      const db = getDb();
+      db.run("CREATE TABLE spawn_fallback_guard (id INTEGER PRIMARY KEY)");
+      await expect(
+        executeReadOnlyQueryBounded(
+          "INSERT INTO spawn_fallback_guard VALUES (1) RETURNING id",
+          [],
+          5000,
+        ),
+      ).rejects.toThrow(/readonly/i);
+      expect(db.query("SELECT * FROM spawn_fallback_guard").all()).toEqual([]);
     } finally {
       Bun.spawn = originalSpawn;
     }
@@ -578,6 +616,41 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(result.rows.length).toBe(1);
   });
 
+  test("fallback rejects column-returning writes and leaves the application connection writable", async () => {
+    process.env.DB_QUERY_BOUNDED_ENABLED = "false";
+    const db = getDb();
+    db.run("CREATE TABLE fallback_readonly_guard (id INTEGER PRIMARY KEY, value TEXT)");
+    db.run("INSERT INTO fallback_readonly_guard VALUES (1, 'original')");
+    const writes = [
+      "INSERT INTO fallback_readonly_guard VALUES (2, 'inserted') RETURNING id",
+      "UPDATE fallback_readonly_guard SET value = 'updated' RETURNING id",
+      "DELETE FROM fallback_readonly_guard RETURNING id",
+      "WITH input(id, value) AS (VALUES (2, 'cte')) INSERT INTO fallback_readonly_guard SELECT * FROM input RETURNING id",
+      "WITH input(id) AS (VALUES (1)) UPDATE fallback_readonly_guard SET value = 'cte' WHERE id IN (SELECT id FROM input) RETURNING id",
+      "WITH input(id) AS (VALUES (1)) DELETE FROM fallback_readonly_guard WHERE id IN (SELECT id FROM input) RETURNING id",
+    ];
+    for (const sql of writes) {
+      await expect(executeReadOnlyQueryGated(sql)).rejects.toThrow(/readonly/i);
+      expect(db.query("SELECT * FROM fallback_readonly_guard").all()).toEqual([
+        { id: 1, value: "original" },
+      ]);
+    }
+    // SQLite does not support a DML statement inside a CTE body.
+    await expect(
+      executeReadOnlyQueryGated(
+        "WITH inserted AS (INSERT INTO fallback_readonly_guard VALUES (2, 'cte') RETURNING id) SELECT * FROM inserted",
+      ),
+    ).rejects.toThrow(/syntax/i);
+    expect(
+      executeReadOnlyQuery("SELECT value FROM fallback_readonly_guard WHERE id = ?", [1]).rows,
+    ).toEqual([["original"]]);
+    expect(executeReadOnlyQuery("PRAGMA table_info(fallback_readonly_guard)").total).toBe(2);
+    db.run("UPDATE fallback_readonly_guard SET value = 'application write' WHERE id = 1");
+    expect(executeReadOnlyQuery("SELECT value FROM fallback_readonly_guard").rows).toEqual([
+      ["application write"],
+    ]);
+  });
+
   // J: HTTP route, flag OFF — still caps rows via the legacy path (the cap is
   // applied by executeReadOnlyQuery too, not just the bounded executor), and
   // must not throw despite a budget that would trip the bounded path.
@@ -611,35 +684,51 @@ describe("db-query bounded execution (Fix 1)", () => {
     expect(body.message).toMatch(/150ms budget/);
   });
 
-  // Review round 4 (desplega-bot, pullrequestreview-4975616777): the
-  // concurrency cap was also collapsed into the generic 400. Saturate the
-  // cap with slots that never release (SELECT 1 calls made without an
-  // `await` between them so the acquire checks all run in the same tick —
-  // same technique as test O), then confirm the one HTTP call that lands on
-  // top gets 429 with a stable code and a Retry-After header instead of 400.
+  // Hold completion of real query children until the HTTP assertion finishes.
+  // SELECT 1 can finish before the HTTP request arrives and release the slots.
   test("caps saturation via the HTTP route returns 429 with a stable code and Retry-After", async () => {
+    const release = Promise.withResolvers<void>();
+    const childExits: Promise<number>[] = [];
+    const originalSpawn = Bun.spawn;
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
+      ...args: Parameters<typeof Bun.spawn>
+    ) => {
+      const child = originalSpawn(...args);
+      const exited = child.exited;
+      childExits.push(exited);
+      Object.defineProperty(child, "exited", {
+        value: release.promise.then(() => exited),
+      });
+      return child;
+    }) as typeof Bun.spawn);
     const fillers = Array.from({ length: getDbQueryConcurrencyCap() }, () =>
       executeReadOnlyQueryBounded("SELECT 1", [], 10_000),
     );
+    spawnSpy.mockRestore();
 
-    const { status, headers, body } = await withDbQueryHttpServer(async (_post) => {
-      const res = await fetch(`http://localhost:${HTTP_TEST_PORT}/api/db-query`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sql: "SELECT 1", params: [] }),
+    try {
+      await Promise.all(childExits);
+      const { status, headers, body } = await withDbQueryHttpServer(async (_post) => {
+        const res = await fetch(`http://localhost:${HTTP_TEST_PORT}/api/db-query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sql: "SELECT 1", params: [] }),
+        });
+        return {
+          status: res.status,
+          headers: res.headers,
+          body: (await res.json()) as DbQueryHttpBody,
+        };
       });
-      return {
-        status: res.status,
-        headers: res.headers,
-        body: (await res.json()) as DbQueryHttpBody,
-      };
-    });
 
-    expect(status).toBe(429);
-    expect(body.error).toBe("db_query_concurrency_cap");
-    expect(headers.get("retry-after")).not.toBeNull();
-
-    await Promise.allSettled(fillers);
+      expect(status).toBe(429);
+      expect(body.error).toBe("db_query_concurrency_cap");
+      expect(headers.get("retry-after")).not.toBeNull();
+    } finally {
+      spawnSpy.mockRestore();
+      release.resolve();
+      await Promise.allSettled(fillers);
+    }
   });
 
   // L: DB_QUERY_HTTP_MAX_ROWS actually reaches the HTTP route's row cap.

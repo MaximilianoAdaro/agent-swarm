@@ -21,22 +21,35 @@ Each row shows a source chip when the underlying environment variable is set on 
 
 ## Groups
 
+### Claude transport default
+
+The **Harness & tools** group includes `CLAUDE_TRANSPORT`, with `cli` as the default and `sdk` as the optional value.
+Agents can inherit this default or assign a transport beneath the harness selector on their details page.
+An agent override takes precedence over the global default. A repository override takes precedence when the session supplies its repository.
+Transport changes apply to future sessions and do not require a worker restart.
+The worker resolves this key for each session instead of retaining a scoped value in its deployment environment.
+SDK selection is incompatible with an effective Claude Bridge or legacy bridge binary.
+
 | Group | Examples |
 | --- | --- |
 | Steering | `STEERING_ENABLED`, `SLACK_THREAD_STEERING`, `SLACK_THREAD_STEERING_MODE` |
 | Memory | `MEMORY_HYBRID_SEARCH`, `MEMORY_GRAPH_EXPANSION`, `MEMORY_RATERS`, `EMBEDDING_MODEL` |
 | Heartbeat & crash recovery | `HEARTBEAT_INTERVAL_MS`, `HEARTBEAT_STALL_THRESHOLD_MIN`, `RUNTIME_STALE_THRESHOLD_MIN`, `HEARTBEAT_PIN_CRASH_RESUME` |
-| Harness & tools | `SCRIPTS_ONLY_MCP`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `WORKER_API_READY_TIMEOUT_SECONDS` |
-| Database queries | `DB_QUERY_BOUNDED_ENABLED`, `DB_QUERY_HTTP_BUDGET_MS`, `DB_QUERY_HTTP_MAX_ROWS`, `DB_QUERY_MCP_BUDGET_MS`, `DB_QUERY_MCP_MAX_ROWS`, `DB_QUERY_CONCURRENCY_CAP` |
-| Integrations | `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `AGENT_FS_REQUEST_TIMEOUT_MS` |
+| Harness & tools | `SCRIPTS_ONLY_MCP`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `OPENROUTER_BASE_URL`, `WORKER_API_READY_TIMEOUT_SECONDS`, `CONTEXT_PREAMBLE_MAX_TOKENS` |
+| Database | `DB_QUERY_BOUNDED_ENABLED`, `DB_QUERY_HTTP_BUDGET_MS`, `DB_QUERY_HTTP_MAX_ROWS`, `DB_QUERY_MCP_BUDGET_MS`, `DB_QUERY_MCP_MAX_ROWS`, `DB_QUERY_CONCURRENCY_CAP`, `SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, `DB_RETENTION_DRY_RUN`, `DB_RETENTION_TICK_BUDGET_MS`, `DB_RETENTION_CATCHUP_INTERVAL_MS`, `DB_RETENTION_MAX_STATEMENT_MS` |
+| Integrations | `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `SLACK_RENDER_V2_DELEGATION`, `SLACK_CONCLUSION_SETTLE_SEC`, `SLACK_CONCLUSION_TIMEOUT_MIN`, `SLACK_TREE_STALL_MIN`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `AGENT_FS_REQUEST_TIMEOUT_MS`, `SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`, `SLACK_REACTION_COMPLETED`, `SLACK_REACTION_FAILED` |
 | Security & access | `RBAC_ENABLED`, `BUDGET_ADMISSION_DISABLED`, `MCP_OAUTH_ALLOW_PRIVATE_HOSTS` |
 | Workflows & scheduler | `WORKFLOW_MAX_ITERATIONS`, `SCHEDULER_INTERVAL_MS` |
 | Telemetry & observability | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `ANONYMIZED_TELEMETRY` |
 | Branding & URLs | `SWARM_ORG_NAME`, `SWARM_BRAND_COLOR`, `DASHBOARD_URL` |
 
-Harness **provider and model selection are deliberately absent** from this page — they are configured per agent. A global value would silently become the default for every agent in the swarm, so those knobs live on each agent's own configuration instead.
+Harness **provider and model selection are deliberately absent** from this page — they are configured per agent. A global value would silently become the default for every agent in the swarm, so those knobs live on each agent's own configuration instead. `OPENROUTER_BASE_URL` is a deployment-wide routing endpoint rather than a model choice, which is why it does belong here.
 
 Settings with deeper behavior link out to the relevant guide (for example the [task steering](/docs/guides/task-steering) and [harness providers](/docs/guides/harness-providers) guides) directly from the row.
+
+<Callout type="warn" title="Database retention permanently deletes history">
+  Leave `SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, and `EVENTS_RETENTION_DAYS` unset to disable their individual sweeps. Each value must be between 1 and 1,000,000 whole days. We recommend at least seven days so recent task recovery and memory rating keep their context. Start with `DB_RETENTION_DRY_RUN=true`, verify the exact would-delete counts, then enable one table at a time. Retention deletes session transcripts, task history, or telemetry. Event aggregate totals become retention-window totals after an event sweep.
+</Callout>
 
 ![Editing a configuration group](/ui/configuration-group.png)
 
@@ -51,7 +64,7 @@ Controls match the value type:
 Every row shows its default, and rows with a stored value offer a **Reset** action that deletes the stored entry and returns the setting to its default (or to the environment value, if one is set). The **Reload config** button in the header forces an immediate config reload — useful after changing environment variables outside the dashboard.
 
 <Callout type="info" title="Credentials live elsewhere">
-  This page intentionally excludes secrets. Integration credentials (Slack tokens, GitHub app keys, OAuth secrets) are managed on the [Integrations](/docs/guides/slack-integration) pages, and swarm-wide secret values on the Secrets page — see the [secrets encryption guide](/docs/guides/secrets-encryption).
+  This page intentionally excludes secrets. Integration credentials (Slack tokens, GitHub app keys, OAuth secrets) are managed on the [Integrations](/docs/integrations/slack) pages, and swarm-wide secret values on the Secrets page — see the [secrets encryption guide](/docs/guides/secrets-encryption).
 </Callout>
 
 <Callout type="info" title="Multiple runtimes per agent">
@@ -62,10 +75,24 @@ Every row shows its default, and rows with a stored value offer a **Reset** acti
   **Workspace state is not shared for you.** Work for one agent can continue on a different process than the one that started it, so runtimes sharing an `AGENT_ID` need compatible workspace state. In Docker Compose or similar deployments, give them the same persistent workspace/repository volume when continuation depends on local files. If their workspaces are independent, task continuation must rely only on state that can be reconstructed from shared sources — the repository, the control plane, or attachments — because enabling this setting does not synchronize arbitrary local filesystem state between workers.
 </Callout>
 
+<Callout type="info" title="OPENROUTER_BASE_URL points the harnesses at a model gateway">
+  This is the one exception to the "no model knobs here" rule above, and it is not a model choice: it sets *where* OpenRouter-shaped requests go, not *which* model runs. Point it at any gateway serving OpenRouter-compatible `GET /models` and `POST /chat/completions` — openrouter.ai, OrcaRouter, or a self-hosted proxy — and the OpenCode and pi-mono harnesses, model refreshes, and internal summarizers all route through it. Leave it blank for openrouter.ai.
+
+  A saved value reaches both sides without a restart. The API server re-injects it over its process environment on the debounced config reload. Each worker fetches the resolved config before starting a task and passes it into the harness adapter, so the change lands on that worker's next task; a task already running keeps the gateway it started with.
+
+  The gateway credential is **not** set here — `OPENROUTER_API_KEY` belongs on the Secrets page or in the worker environment. Setup for each harness, model-string rules, and which harnesses this cannot redirect: [Model Gateways](/docs/guides/provider-auth/model-gateways).
+</Callout>
+
 <Callout type="warn" title="WORKER_API_READY_TIMEOUT_SECONDS is bootstrap-only">
   Every worker and lead container's `docker-entrypoint.sh` polls the control-plane API's public `GET /health` endpoint before doing anything else that depends on it (fetching config, syncing skills, restoring services). If the API never becomes reachable within `WORKER_API_READY_TIMEOUT_SECONDS` (a positive integer, default `90`), the container logs a stable `[entrypoint] FATAL: API readiness timed out after Ns waiting for <url>; exiting.` line and exits non-zero rather than starting half-provisioned.
 
   This check runs **before** the container can reach the API at all, so it can only ever read the value from its own process environment — a row saved here documents and validates the setting (and is what the **Restart required** badge refers to), but it cannot reach an already-waiting container. Set it as a real deployment environment variable on the worker/lead container, not just in the dashboard.
+</Callout>
+
+<Callout type="warn" title="CONTEXT_PREAMBLE_MAX_TOKENS is read once at process start">
+  Every follow-up task gets a bounded text summary of its parent/ancestor task chain prepended to its prompt, uniformly across all harness providers (not just those with native session resume). `CONTEXT_PREAMBLE_MAX_TOKENS` (default `2000`, ~4 chars/token, so ~8,000 chars) caps that summary's size. It exists to prevent the SIGTERM-143 context-saturation failure mode seen with unbounded session resumes — raising it too far risks reintroducing that failure, so keep it well below the target model's context window.
+
+  The API server reads this value into a module-level constant at boot, so a saved value takes effect on the next restart (the **Restart required** badge on this row).
 </Callout>
 
 ## Access control

@@ -6,6 +6,160 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.145.0] - 2026-09-11
+
+### Added
+- **Task callers can require structured JSON results with `send-task.outputSchema`** on both owner and user MCP surfaces (#1419). Invalid nested schemas are rejected at submission, and completion validates the result.
+- **The Configuration page exposes the follow-up context preamble budget**, with a validated 100–20,000 token range and a restart requirement (#1423).
+
+### Changed
+- **25 core tools are available without discovery**, adding frequently used script, query, KV, configuration, repository, memory-editing, and steering operations (#1422).
+
+### Fixed
+- **Memory edits enforce ownership or lead authorization**, including edits by ID to swarm-visible memories (#1425).
+- **Fallback database queries use a read-only connection**, blocking writes even when a statement returns rows (#1424).
+
+## [1.144.0] - 2026-09-10
+
+### Added
+- **Realtime rooms share state between pages, agents, scripts, and workflows** (#1406), with browser presence, transient channels, MCP room operations, and a dashboard snapshot inspector.
+- **Claude workers can opt into the Agent SDK transport** (#1404). The dashboard exposes transport selection and identifies SDK sessions on task details and agent lists (#1411).
+- **Delegated Slack task results reach the originating thread** (#1372), including late child results and failure outcomes when delegation rendering is enabled.
+
+### Fixed
+- **Published pages default to a light canvas** (#1409), and the browser SDK no longer requests the removed configuration endpoint (#1412).
+- **Sandbox resource limits always run through Bash** (#1405), avoiding shell-dependent launch failures.
+- **WebSocket dependencies no longer resolve the vulnerable ws version** (#1410, #1415).
+- **Rebuilt visual reports preserve Vercel deployment guards** (#1407).
+
+## [1.143.0] - 2026-09-09
+
+### Added
+- **Codex tasks run through an isolated app-server with native steering and interruption** (#1393), with queued input accepted on the next turn and process-group termination as a cancellation fallback.
+- **Slack reactions are configurable per event** (#1384), covering acceptance, buffering, immediate flush, steering, completion, and failure, with shortcode validation and default fallback.
+- **A public operator skill guides Compose and Helm installations** (#1388), with setup checklists and a shorter README.
+
+### Changed
+- **Gateway setup supports any OpenAI-compatible endpoint for pi and opencode** (#1383), with dashboard configuration and updated provider guidance.
+- **Templates UI upgrades Next.js to 16.3.3** (#1398).
+
+### Fixed
+- **Slack terminal replies survive API restarts** (#1378), with durable pending delivery and persisted progress-message tracking for retries.
+- **Codex app-server logs render in the dashboard and eval viewer** (#1399), and task context usage follows the shared display calculation. Codex advisories are distinguished from failures and Astra models are labeled correctly (#1387).
+- **Worker identity refreshes safely before each task prompt** (#1391), preserving local edits while applying current profile defaults.
+- **Sandboxed scripts have independent process-tree containment** (#1392), including descendants that start a new session.
+- **ACP protocol traffic is persisted for diagnostics and configuration metadata is scrubbed before emission** (#1385, #1389).
+- **Published pages preserve authored styles when Tailwind loads** (#1382).
+- **The feedback popup waits for the configured install age**, and dashboard status tolerates older APIs without automation fields (#1390, #1381).
+- **Script pause, query saturation, and migration queue checks are more stable** (#1396).
+
+## [1.142.0] - 2026-09-08
+
+### Added
+- **Fresh self-hosted installs bootstrap bundled automations safely** (#1330), with shared preflight checks for required parameters and integrations, `needs_setup` status in the dashboard, and fail-forward dispatch until setup is complete.
+- **The dashboard configures Agent Client Protocol target presets** (#1368), including discovered presets, custom commands and arguments, environment overrides, and editable per-agent runtime settings.
+- **A Playwright dashboard E2E suite publishes durable evidence and tracker results** (#1364, #1373), with seeded isolated stacks, nightly coverage, agent-fs artifacts, PR summaries, and ingest validation.
+
+### Changed
+- **Durable script workflows broker swarm capabilities outside the user-code realm** (#1304), keeping authenticated host operations behind a bounded capability bridge while workflow code runs in a credential-free guest.
+
+### Fixed
+- **Provider and script subprocess trees terminate as process groups** (#1371), preventing grandchildren from surviving cancellation, timeout, or worker shutdown.
+- **Codex reports the resolved OAuth pool slot as its primary credential** (#1370), so runtime readiness and dashboard status reflect the credential actually selected for the session.
+
+## [1.141.0] - 2026-09-07
+
+### Added
+- **Operators can select Agent Client Protocol runtimes from the dashboard** (#1363), including runtime-aware agent settings, provider icons, capability checks, and API support for the `acp` harness.
+
+### Fixed
+- **Directly assigned tasks are not rejected by inherited routing affinity** (#1362), so explicit ownership takes precedence over provenance inherited from a parent task.
+- **Routing-affinity enforcement is audited across task dispatch and recovery paths** (#1365), closing gaps in follow-up routing and documenting the end-to-end invariants.
+
+## [1.140.0] - 2026-09-06
+
+### Added
+- **Self-hosted installs show a one-time admin feedback popup** (#1331) that posts straight from the browser to a configurable feedback endpoint, with no swarm-side route or storage.
+
+### Changed
+- **Worker browser automation moves from `qa-use` to `agent-browser`** (#1352). The full worker image installs `agent-browser` 0.36.0 next to a direct `playwright` 1.58.0 pin and points it at the existing Playwright Chromium, so the image still ships one browser. The `qa-use` CLI and its baked skill are gone. A new seeded `agent-browser` skill covers the snapshot, act, screenshot loop, the agent-fs upload recipe, and the manual fallback on the slim image, and the seeded `qa` skill now defaults to it (pristine seeded copies update at the next boot; operator-edited copies are preserved as usual).
+- **Worker harness pins move to the current weekly releases** (#1359) for Claude Code, pi, Codex, and OpenCode, with matching package dependencies.
+
+### Fixed
+- **Agent start-up scripts stay readable after a container restart** (#1360), so workers that ship a setup script no longer crash-loop on `Permission denied` until they are recreated.
+
+## [1.139.0] - 2026-09-05
+
+### Added
+- **Pull requests can publish Slack workflow screenshots as visual E2E evidence** (#1338), with legacy and v2 rendering scenarios, artifact capture, and an automated PR comment.
+- **Hosted dashboard builds can select their Plausible site independently** (#1334) through `VITE_PLAUSIBLE_SCRIPT_ID`, so demo and production deployments do not mix analytics.
+- **The authenticated stats endpoint reports effective multi-runtime state** (#1327), allowing clients to distinguish a disabled feature from an enabled deployment with no registered runtimes.
+
+### Changed
+- **Bundled agent-fs deployments move to v0.13.5** (#1347) across worker, Docker Compose, Helm, and co-deployment documentation pins.
+- **Product integration documentation uses one consolidated section** (#1325), with canonical guides and corrected cross-links across setup, playbooks, and references.
+- **Provider documentation makes capability gaps explicit** (#1353), with a dedicated comparison matrix and clearer personalization guidance.
+- **Worker harness pins track current compatible releases** (#1358) — Codex plus its SDK move to 0.153.4, adding GPT-6 Astra to the explicit-model catalog with current pricing, context-window, and reasoning metadata.
+
+### Fixed
+- **Reboot recovery preserves tasks claimed after server boot** (#1351), registers active sessions before slow provider startup, and bounds opencode session creation.
+- **The script sandbox handles loaded-host process limits predictably** (#1326), with additional process headroom and retryable `capacity_exceeded` classification.
+- **Pool-starvation escalation enforces Lead authorization explicitly** (#1344) instead of inheriting ordinary routing affinity.
+- **Worker bootstrap rewrites remove stale files first** (#1350), preventing failed overwrites during container startup.
+- **Skill search tokenizes multi-word queries** (#1328), improving matches without changing the skill catalog.
+- **Nightly E2E reporting preserves Codex OAuth data and collects logs portably** (#1348).
+- **Agent-fs provisioning retries after boot registration** (#1355), recovering when the initial worker setup races agent registration.
+- **Sandbox-spawning SIGABRT tests use an explicit timeout** (#1354), preserving coverage under parallel CI load.
+
+## [1.138.0] - 2026-09-03
+
+### Added
+- **A generic Agent Client Protocol harness can run any ACP-speaking coding agent** (#1320), including provider selection, session execution, and setup documentation.
+- **Microsoft Graph joins the built-in connection catalog** (#1318), with credential binding and typed access from swarm scripts.
+- **A black-box E2E runner validates REST and MCP contracts against live swarm stacks** (#1311), with deterministic coverage reporting and reusable scenario infrastructure.
+- **The dashboard supports a fixed public demo mode** (#1319) and reports actionable setup failures during a user's first task (#1312).
+- **Onboarding treats harness-provider selection as a first-class setup step** (#1315).
+- **Integration connection telemetry records successful setup events** (#1324).
+
+### Fixed
+- **UI follow-up tasks route to the Lead** (#1316), preserving authorization and intended ownership.
+- **Codex OAuth respects `HOME` overrides** (#1313) when locating the local credential store.
+- **Slack can target a mock API endpoint for deterministic integration tests** (#1310).
+- **Pre-push sandbox checks probe process capacity before running affected tests** (#1314, #1317), reducing loaded-host false failures.
+- **Memory search consumption counts each returned document once** (#1264).
+- **Next build output is excluded from repository lint scans** (#1321).
+
+## [1.137.0] - 2026-09-03
+
+### Added
+- **Onboarding can configure Docker Compose image pull policy** (#1302) — `onboard --pull-policy` accepts `always`, `missing`, or `never` and writes the choice into generated Compose services.
+- **Claude Fable 5.1 and Mythos 5.1 are available across direct and managed Claude runtimes** (#1303), including model-picker labels, shortname resolution, context windows, and pricing fallbacks.
+
+### Changed
+- **Bundled agent-fs deployments move to v0.13.3** (#1306), with a new `bump:agent-fs` command that validates and updates the worker, Compose, Helm, and documentation pins together.
+- **Worker harness pins track current compatible releases** (#1296) — Claude Code moves to 2.1.258, Codex plus its SDK to 0.152.1, and OpenCode plus its SDK to 1.18.26.
+
+### Fixed
+- **Workflow retries restore checkpointed inputs and preserve the branch originally taken** (#1297, #1298), preventing empty interpolations and execution of inactive branches after a retry.
+- **Cancelling a workflow closes its pending approval gates** (#1300), rejects stale responses, and notifies linked Slack approval threads.
+- **Lead-only task authorization is enforced across assignment, offers, claims, and recovery** (#1276), while ordinary tasks may still target Lead agents.
+- **Database retention drains oldest rows predictably and exposes bounded catch-up telemetry** (#1299), so large backlogs converge without starving later tables.
+- **Star-history refreshes install their own renderer dependency** (#1301), removing reliance on runner-global tooling.
+
+## [1.136.0] - 2026-09-01
+
+### Added
+- **Operators can opt into retention windows for non-critical database logs** (#1252) — independent session, agent, and event policies support dry-run counts, bounded deletion, metrics, and an operational rollout guide while remaining disabled by default.
+
+### Changed
+- **Worker harness pins track current compatible releases** (#1277) — Claude Code moves to 2.1.251, Pi to 0.84.4, Codex to 0.151.0, and OpenCode plus its SDK to 1.18.25.
+
+### Fixed
+- **Inbound API telemetry resolves to endpoint-level resources in APM backends** (#1293) — HTTP request spans now use OpenTelemetry's `SERVER` kind, preserve low-cardinality route templates, and record premature response closes without inflating error rates.
+- **Sibling task prompts distinguish creation time from recent activity** (#1281) — progress updates no longer make an older sibling look newly submitted and trigger duplicate-work assumptions.
+- **Tasks with attachments become dispatchable only after their upload batch settles** (#1273) — draft tasks remain visible and cancelable, promote idempotently after uploads, and self-promote after abandoned uploads time out.
+- **The documentation root uses a permanent redirect** (#1284), avoiding repeated temporary redirects for clients and crawlers.
+
 ## [1.135.2] - 2026-08-29
 
 ### Changed
@@ -1074,7 +1228,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [1.71.0] - 2026-04-27
 
 ### Added
-- **Jira Cloud integration** — full OAuth 3LO authorization code flow against `api.atlassian.com`, cloudId resolution via `/oauth/token/accessible-resources`, and a typed `jiraFetch()` that prepends `/ex/jira/{cloudId}`, refreshes on 401, and respects 429 `Retry-After`. New routes: `GET /authorize`, `GET /callback`, `GET /status`, `POST /webhook/:token`, `POST /api/trackers/jira/webhook-register`, `DELETE /api/trackers/jira/webhook/:id`. Inbound: assignee→bot transitions and @-mention comments create swarm tasks; outbound: lifecycle events (`task.created/completed/failed/cancelled`) post unicode-emoji plaintext comments back to the originating issue. Webhook auth uses URL-path token (timing-safe compare) — Atlassian doesn't HMAC-sign OAuth 3LO dynamic webhooks (Errata I8). Webhook keepalive runs every 12h and refreshes any registration with <7d to expiry. New ADF (Atlassian Document Format) recursive walker for inbound comment/issue body parsing. Migration `043_jira_source.sql` adds `jira` to the `agent_tasks` source CHECK constraint. 57 new unit tests across `jira-metadata`, `jira-webhook`, `jira-sync`, `jira-oauth`, `jira-outbound-sync`, `jira-webhook-lifecycle`. Full integration guide at [`/docs/guides/jira-integration`](/docs/guides/jira-integration). New Integrations UI card with cloudId/siteUrl/scope/expiry/webhook count + copyable redirect URL (#382)
+- **Jira Cloud integration** — full OAuth 3LO authorization code flow against `api.atlassian.com`, cloudId resolution via `/oauth/token/accessible-resources`, and a typed `jiraFetch()` that prepends `/ex/jira/{cloudId}`, refreshes on 401, and respects 429 `Retry-After`. New routes: `GET /authorize`, `GET /callback`, `GET /status`, `POST /webhook/:token`, `POST /api/trackers/jira/webhook-register`, `DELETE /api/trackers/jira/webhook/:id`. Inbound: assignee→bot transitions and @-mention comments create swarm tasks; outbound: lifecycle events (`task.created/completed/failed/cancelled`) post unicode-emoji plaintext comments back to the originating issue. Webhook auth uses URL-path token (timing-safe compare) — Atlassian doesn't HMAC-sign OAuth 3LO dynamic webhooks (Errata I8). Webhook keepalive runs every 12h and refreshes any registration with <7d to expiry. New ADF (Atlassian Document Format) recursive walker for inbound comment/issue body parsing. Migration `043_jira_source.sql` adds `jira` to the `agent_tasks` source CHECK constraint. 57 new unit tests across `jira-metadata`, `jira-webhook`, `jira-sync`, `jira-oauth`, `jira-outbound-sync`, `jira-webhook-lifecycle`. Full integration guide at [`/docs/integrations/jira`](/docs/integrations/jira). New Integrations UI card with cloudId/siteUrl/scope/expiry/webhook count + copyable redirect URL (#382)
 - New tracker provider `jira` is now recognized by `tracker-status`, `tracker-link-task`, `tracker-map-agent`, and `tracker-sync-status` MCP tools
 
 ### Fixed

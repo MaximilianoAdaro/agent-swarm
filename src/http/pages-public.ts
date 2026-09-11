@@ -102,26 +102,36 @@ const publicPageJsonRoute = route({
  * Default `<head>` injection: `<base>` so links escape the iframe, Tailwind
  * Play CDN so agent pages can use utility classes out of the box, Space
  * Grotesk / Space Mono fonts to match the swarm SPA, a small reset that
- * makes pages theme-aware (dark by default) so an agent who writes zero CSS
+ * makes pages theme-aware (light by default) so an agent who writes zero CSS
  * still gets a presentable page, and finally the Browser SDK so
  * `window.swarmSdk` works.
  *
- * Agent-provided styles ALWAYS win — the reset uses generic selectors with
- * low specificity. Tailwind is loaded as an opt-in tool, not an enforced
- * theme.
+ * Agent-provided styles can override these defaults. Tailwind utilities stay
+ * available, but its Preflight reset is disabled to preserve browser heading,
+ * margin, and list styles.
  */
 const PAGE_HEAD_DEFAULTS = `<base target="_blank">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
+<script>
+  if (window.tailwind) {
+    window.tailwind.config = { corePlugins: { preflight: false } };
+  }
+</script>
 <style>
+  *, ::before, ::after { box-sizing: border-box; border: 0 solid #e5e7eb; }
+  hr { border-top-width: 1px; }
+  img, video { display: block; max-width: 100%; height: auto; }
+  button, input, optgroup, select, textarea, ::file-selector-button { font: inherit; }
   :root {
-    --swarm-bg: #0b0f17;
-    --swarm-card: #121826;
-    --swarm-border: #22304a;
-    --swarm-text: #e6eaf2;
-    --swarm-muted: #7c8aa6;
+    color-scheme: light;
+    --swarm-bg: #fbfbfa;
+    --swarm-card: #ffffff;
+    --swarm-border: #e5e7eb;
+    --swarm-text: #111827;
+    --swarm-muted: #6b7280;
     --swarm-primary: #3b82f6;
   }
   html, body { background: var(--swarm-bg); color: var(--swarm-text); }

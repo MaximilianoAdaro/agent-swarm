@@ -49,6 +49,7 @@ import {
 import { useUsers } from "@/api/hooks/use-users";
 import type {
   AgentLog,
+  ClaudeProviderMeta,
   DevinProviderMeta,
   ProviderName,
   SessionCost,
@@ -65,6 +66,7 @@ import { StatusBadge } from "@/components/shared/status-badge";
 import { TaskAttachmentsSection } from "@/components/shared/task-attachments-section";
 import { CollapsibleComposerDock } from "@/components/steering/collapsible-composer-dock";
 import { SteerComposer } from "@/components/steering/steer-composer";
+import { TaskFailureHelpDialog } from "@/components/support/task-failure-help-dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -86,6 +88,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useLocalToggle } from "@/hooks/use-local-toggle";
 import { readStringParam, useUrlSearchState } from "@/hooks/use-url-search-state";
+import { findLatestUsableContextSnapshot } from "@/lib/context-display";
 import { formatCost } from "@/lib/cost-format";
 import { formatDurationMs } from "@/lib/format-duration-ms";
 import { formatTokens } from "@/lib/format-tokens";
@@ -279,7 +282,7 @@ function TaskCostSection({
   costs: SessionCost[] | undefined;
   isLoading: boolean;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
 }) {
   const isDevin = provider === "devin";
   const devinMeta = isDevin ? (providerMeta as DevinProviderMeta | undefined) : undefined;
@@ -404,7 +407,7 @@ function TaskContextSection({
   context: TaskContextResponse | undefined;
   isLoading: boolean;
   provider?: ProviderName;
-  providerMeta?: DevinProviderMeta | Record<string, never>;
+  providerMeta?: DevinProviderMeta | ClaudeProviderMeta | Record<string, never>;
   costs?: SessionCost[];
 }) {
   const isDevin = provider === "devin";
@@ -464,10 +467,7 @@ function TaskContextSection({
   if (!context || context.summary.snapshotCount === 0) return null;
 
   const { summary } = context;
-  const latestSnapshot = context.snapshots[context.snapshots.length - 1];
-  const currentPercent = latestSnapshot?.contextPercent ?? summary.peakContextPercent ?? 0;
-  const usedTokens = latestSnapshot?.contextUsedTokens ?? summary.peakContextTokens ?? 0;
-  const totalTokens = latestSnapshot?.contextTotalTokens ?? summary.contextWindowSize ?? 0;
+  const latestUsageSnapshot = findLatestUsableContextSnapshot(context.snapshots);
 
   return (
     <>
@@ -476,32 +476,42 @@ function TaskContextSection({
         <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
           Context Usage
         </span>
-        <div className="flex items-center gap-2 py-1">
-          <Progress
-            value={currentPercent}
-            className={cn("h-1.5 flex-1", progressBarTone(currentPercent))}
-          />
-          <span className="text-[10px] font-mono text-muted-foreground shrink-0">
-            {currentPercent.toFixed(0)}%
-          </span>
-        </div>
-        <MetaRow icon={Cpu} label="Used">
-          <span className="flex flex-col items-start gap-1 font-mono text-xs">
-            <span className="whitespace-nowrap">
-              {formatTokens(usedTokens)} / {formatTokens(totalTokens)}
-            </span>
-            {latestSnapshot?.contextFormula && latestSnapshot.contextFormula !== "unknown" && (
-              <Badge
-                variant="outline"
-                size="tag"
-                className="text-muted-foreground"
-                title={`Computed via formula: ${latestSnapshot.contextFormula}`}
-              >
-                {latestSnapshot.contextFormula}
-              </Badge>
-            )}
-          </span>
-        </MetaRow>
+        {latestUsageSnapshot ? (
+          <>
+            <div className="flex items-center gap-2 py-1">
+              <Progress
+                value={latestUsageSnapshot.contextPercent}
+                className={cn("h-1.5 flex-1", progressBarTone(latestUsageSnapshot.contextPercent))}
+              />
+              <span className="text-[10px] font-mono text-muted-foreground shrink-0">
+                {latestUsageSnapshot.contextPercent.toFixed(0)}%
+              </span>
+            </div>
+            <MetaRow icon={Cpu} label="Used">
+              <span className="flex flex-col items-start gap-1 font-mono text-xs">
+                <span className="whitespace-nowrap">
+                  {formatTokens(latestUsageSnapshot.contextUsedTokens)} /{" "}
+                  {formatTokens(latestUsageSnapshot.contextTotalTokens)}
+                </span>
+                {latestUsageSnapshot.contextFormula &&
+                  latestUsageSnapshot.contextFormula !== "unknown" && (
+                    <Badge
+                      variant="outline"
+                      size="tag"
+                      className="text-muted-foreground"
+                      title={`Computed via formula: ${latestUsageSnapshot.contextFormula}`}
+                    >
+                      {latestUsageSnapshot.contextFormula}
+                    </Badge>
+                  )}
+              </span>
+            </MetaRow>
+          </>
+        ) : (
+          <MetaRow icon={Cpu} label="Current">
+            <span className="text-xs text-muted-foreground">Unavailable</span>
+          </MetaRow>
+        )}
         {summary.peakContextPercent != null && (
           <MetaRow icon={Activity} label="Peak">
             <span className="text-xs font-mono">{summary.peakContextPercent.toFixed(0)}%</span>
@@ -1021,6 +1031,14 @@ export default function TaskDetailPage() {
                 {task.harnessVariantMeta.version}
               </span>
             ) : null}
+            {task.providerMeta &&
+            "transport" in task.providerMeta &&
+            task.providerMeta.transport === "sdk" ? (
+              <span className="opacity-60" title="Ran through the Claude Agent SDK transport">
+                {" · "}
+                sdk
+              </span>
+            ) : null}
           </Badge>
         )}
         {(() => {
@@ -1122,6 +1140,7 @@ export default function TaskDetailPage() {
 
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+      <TaskFailureHelpDialog task={task} />
       {/* Breadcrumb — fixed at top across all breakpoints */}
       <div className="px-1 pb-2 shrink-0">
         <button

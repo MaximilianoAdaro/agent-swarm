@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
-import { getDbClient, getTaskById } from "../be/db";
+import { getAgentById, getDbClient, getTaskById } from "../be/db";
 import { getEmbeddingProvider, getMemoryStore } from "../be/memory";
 import { canReadMemory } from "../be/memory/access";
 import { CANDIDATE_SET_MULTIPLIER } from "../be/memory/constants";
@@ -9,7 +9,11 @@ import { expandCandidatesWithGraph } from "../be/memory/graph-expansion";
 import { indexMemoryContent } from "../be/memory/index-content";
 import { refreshLinks } from "../be/memory/link-resolver";
 import { getLinksForMemory, type MemoryLinksResult } from "../be/memory/links-store";
-import { recordRetrievals } from "../be/memory/raters/retrieval";
+import {
+  dedupeMemoryDocumentIds,
+  recordMemoryAccesses,
+  recordRetrievals,
+} from "../be/memory/raters/retrieval";
 import { applyRating, ExplicitSelfDuplicateError } from "../be/memory/raters/store";
 import {
   type RatingEvent,
@@ -20,7 +24,10 @@ import { rerank } from "../be/memory/reranker";
 import { getRetrievalsForAgent, hasRetrievalForTask } from "../be/memory/retrieval-store";
 import { getUsefulnessStats } from "../be/memory/usefulness-stats";
 import { shouldPersistAutomaticTaskMemory } from "../memory/automatic-task-gate";
+import { SIMILARITY_THRESHOLD } from "../prompts/memories";
+import { can } from "../rbac";
 import { AgentMemorySchema, AgentMemoryScopeSchema, AgentMemorySourceSchema } from "../types";
+import { getRequestAuth } from "../utils/request-auth-context";
 import { scrubSecrets } from "../utils/secret-scrubber";
 import { route } from "./route-def";
 import { jsonError, parseQueryParams } from "./utils";
@@ -77,6 +84,7 @@ const MemorySearchResultItemSchema = z.object({
   source: AgentMemorySourceSchema,
   scope: AgentMemoryScopeSchema,
   tags: z.array(z.string()),
+  accessCount: z.number(),
 });
 
 const searchMemory = route({
@@ -126,6 +134,7 @@ const editMemory = route({
     "Edit a single memory in place while preserving its ID and usefulness posterior. Modes: 'replace' overwrites entire content; 'exact' performs surgical find-and-replace of oldString→newString (fails if missing or ambiguous)",
   tags: ["Memory"],
   auth: { apiKey: true, agentId: true },
+  rbac: { permission: "memory.edit.any" },
   body: z.object({
     memoryId: z.string().uuid().optional(),
     key: z.string().min(1).optional(),
@@ -140,6 +149,7 @@ const editMemory = route({
   responses: {
     200: { description: "Memory edited", schema: MemoryEditResultSchema },
     400: { description: "Validation error" },
+    403: { description: "Permission denied: requires memory owner or lead" },
     404: { description: "Memory not found" },
     409: { description: "Version conflict" },
   },
@@ -586,8 +596,10 @@ export async function handleMemory(
   req: IncomingMessage,
   res: ServerResponse,
   pathSegments: string[],
-  myAgentId: string | undefined,
+  callerAgentId: string | undefined,
 ): Promise<boolean> {
+  // Page memory operations use the owner's scope. Authentication and audit retain the signed viewer.
+  const myAgentId = getRequestAuth(req)?.page?.executionAgentId ?? callerAgentId;
   if (indexMemory.match(req.method, pathSegments)) {
     const parsed = await indexMemory.parse(req, res, pathSegments, new URLSearchParams());
     if (!parsed) return true;
@@ -689,6 +701,10 @@ export async function handleMemory(
         : sourceTaskIdHeader;
       const contextKeyHeader = req.headers["x-context-key"];
       const contextKey = Array.isArray(contextKeyHeader) ? contextKeyHeader[0] : contextKeyHeader;
+      const consumptionHeader = req.headers["x-memory-consumption"];
+      const consumptionMode = Array.isArray(consumptionHeader)
+        ? consumptionHeader[0]
+        : consumptionHeader;
       if (sourceTaskId && intent) {
         try {
           await recordRetrievals(
@@ -707,6 +723,21 @@ export async function handleMemory(
         }
       }
 
+      let consumedIds: string[] = [];
+      if (intent) {
+        const consumed =
+          consumptionMode === "prompt"
+            ? ranked.filter((r) => r.similarity > SIMILARITY_THRESHOLD)
+            : ranked;
+        consumedIds = dedupeMemoryDocumentIds(consumed);
+        try {
+          await recordMemoryAccesses(consumedIds);
+        } catch (err) {
+          console.error("[memory-search] recordMemoryAccesses failed:", (err as Error).message);
+        }
+      }
+      const consumedIdSet = new Set(consumedIds);
+
       searchMemory.respond(res, 200, {
         results: ranked.map((r) => ({
           id: r.id,
@@ -719,6 +750,7 @@ export async function handleMemory(
           source: r.source,
           scope: r.scope,
           tags: r.tags,
+          accessCount: (r.accessCount ?? 0) + (consumedIdSet.has(r.id) ? 1 : 0),
         })),
       });
     } catch (err) {
@@ -856,6 +888,30 @@ export async function handleMemory(
 
     try {
       const store = getMemoryStore();
+      // Key+scope edits already constrain the owner in store.edit(). IDs do not.
+      // Internal indexing and re-embedding intentionally bypass this entrypoint.
+      if (memoryId) {
+        const memory = await store.peek(memoryId);
+        if (!memory) {
+          jsonError(res, "Memory not found", 404);
+          return true;
+        }
+        const agent = await getAgentById(myAgentId);
+        const decision = can({
+          principal: { kind: "agent", agentId: myAgentId, isLead: agent?.isLead ?? false },
+          verb: "memory.edit.any",
+          resource: { kind: "owned", ownerAgentId: memory.agentId, scope: memory.scope },
+          source: "http",
+        });
+        if (!decision.allow) {
+          jsonError(
+            res,
+            "Permission denied. You can only edit your own memories unless you are the lead.",
+            403,
+          );
+          return true;
+        }
+      }
       const result = await store.edit({
         id: memoryId,
         key,
@@ -875,7 +931,11 @@ export async function handleMemory(
         if (embedding) await store.updateEmbedding(result.memory.id, embedding, provider.name);
         try {
           // Edit path: prune links derived from removed content (sequel links survive).
-          await refreshLinks(result.memory.id, myAgentId, result.memory.content);
+          await refreshLinks(
+            result.memory.id,
+            result.memory.agentId ?? myAgentId,
+            result.memory.content,
+          );
         } catch (err) {
           console.error(
             `[memory-edit] Link resolution failed for ${result.memory.id}:`,

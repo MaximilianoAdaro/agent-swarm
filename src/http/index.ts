@@ -8,7 +8,13 @@ import { ensure, initialize } from "@desplega.ai/business-use";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { getEnabledCapabilities, hasCapability } from "@/server";
 import { initAgentMail } from "../agentmail";
-import { closeDb, getSwarmConfigs, upsertSwarmConfig } from "../be/db";
+import {
+  closeDb,
+  emitBuiltInIntegrationConnectedOnce,
+  getSwarmConfigs,
+  upsertSwarmConfig,
+} from "../be/db";
+import { startDbRetention, stopDbRetention } from "../be/db-retention";
 import {
   enqueueAuditRow,
   flushAuditBuffer,
@@ -33,6 +39,9 @@ import {
 } from "../otel";
 import { startQueueStallAlarm, stopQueueStallAlarm } from "../queue-stall-alarm";
 import { clearAuditSink, isRbacEnabled, setAuditSink } from "../rbac";
+import { realtimeBus } from "../realtime/bus";
+import { closeRooms, removeNamespaceRooms, sweepRooms } from "../realtime/rooms";
+import { attachRealtimeTransport } from "../realtime/transport";
 import { startScriptRunSupervisor, stopScriptRunSupervisor } from "../script-workflows/supervisor";
 import { getServerSessionsProcessed } from "../server-runtime-counters";
 import { startSlackApp, stopSlackApp } from "../slack";
@@ -85,7 +94,9 @@ import { handlePagesPublic } from "./pages-public";
 import { handlePoll } from "./poll";
 import { handlePricing } from "./pricing";
 import { handlePromptTemplates } from "./prompt-templates";
+import { handleRealtimeAsset } from "./realtime";
 import { handleRepos } from "./repos";
+import { handleRooms } from "./rooms";
 import { describeRequestRoute } from "./route-def";
 import { handleSchedules } from "./schedules";
 import { handleScriptConnectionProxy } from "./script-connection-proxy";
@@ -107,6 +118,7 @@ import {
   parseQueryParams,
   safeRequestUrlForLog,
   setCorsHeaders,
+  wireHttpSpanLifecycle,
 } from "./utils";
 import { handleWebhooks } from "./webhooks";
 import { handleWorkflowEvents } from "./workflow-events";
@@ -137,6 +149,7 @@ const globalState = globalThis as typeof globalThis & {
   __sigintRegistered?: boolean;
   __apiGcInterval?: ReturnType<typeof setInterval>;
   __runId?: string;
+  __closeRealtime?: () => void;
 };
 
 const API_GC_INTERVAL_MS = 5 * 60 * 1000;
@@ -172,6 +185,9 @@ function startApiGcInterval() {
   }
 
   const interval = setInterval(() => {
+    void sweepRooms().catch((error) =>
+      console.error("[rooms] Sweep failed:", scrubSecrets(String(error))),
+    );
     const closedOwnerTransports = closeIdleMcpTransports(transports, transportActivity, {
       idleTimeoutMs: MCP_TRANSPORT_IDLE_TIMEOUT_MS,
       label: "MCP",
@@ -198,6 +214,7 @@ function startApiGcInterval() {
 
 // Clean up previous server on hot reload
 if (globalState.__httpServer) {
+  globalState.__closeRealtime?.();
   console.log("[HTTP] Hot reload detected, closing previous server...");
   globalState.__httpServer.close();
 }
@@ -213,7 +230,6 @@ const transportActivityUser: McpTransportActivity = globalState.__transportActiv
 const httpServer = createHttpServer(async (req, res) => {
   const startTime = performance.now();
   let statusCode = 200;
-  let spanEnded = false;
 
   // Wrap writeHead to capture status code
   const originalWriteHead = res.writeHead.bind(res);
@@ -245,51 +261,43 @@ const httpServer = createHttpServer(async (req, res) => {
   await withRemoteContext(req.headers as Record<string, unknown>, async () => {
     const reqPath = req.url?.split("?")[0] ?? "";
     const pathSegments = getPathSegments(req.url || "");
+    const hasQueryString = (req.url ?? "").includes("?");
+    const hasTrailingSlash = reqPath.length > 1 && reqPath.endsWith("/");
     const skipSpan = reqPath === "/api/poll" && !isPollTracingEnabled();
     // Per OTel HTTP semantic conventions: span name is `{METHOD} {route-template}`
     // and `http.route` carries the bounded-cardinality template so SigNoz can
     // group/filter/aggregate by endpoint as a first-class field. `http.route` is
     // omitted (not fabricated) for unmatched core/MCP/404 paths. Raw path stays
     // on `url.path`.
-    const { spanName, httpRoute } = describeRequestRoute(req.method, pathSegments);
+    const { spanName, httpRoute } = describeRequestRoute(
+      req.method,
+      pathSegments,
+      hasQueryString,
+      hasTrailingSlash,
+    );
     // Standard OTel HTTP server semconv attributes — host, scheme, protocol
     // version, user-agent (the method/path/route/status are set inline below).
     const semconv = httpServerSemconvAttributes(req);
     const span = skipSpan
       ? null
-      : startSpan(spanName, {
-          "http.request.method": req.method ?? "",
-          "url.path": reqPath,
-          "url.scheme": semconv["url.scheme"],
-          "http.route": httpRoute,
-          "server.address": semconv["server.address"],
-          "network.protocol.version": semconv["network.protocol.version"],
-          "user_agent.original": semconv["user_agent.original"],
-          "agent.id": req.headers["x-agent-id"] as string | undefined,
-          "agentswarm.component": "api",
-        });
+      : startSpan(
+          spanName,
+          {
+            "http.request.method": req.method ?? "",
+            "url.path": reqPath,
+            "url.scheme": semconv["url.scheme"],
+            "http.route": httpRoute,
+            "server.address": semconv["server.address"],
+            "network.protocol.version": semconv["network.protocol.version"],
+            "user_agent.original": semconv["user_agent.original"],
+            "agent.id": req.headers["x-agent-id"] as string | undefined,
+            "agentswarm.component": "api",
+          },
+          { kind: "server" },
+        );
 
     if (span) {
-      res.on("finish", () => {
-        if (spanEnded) return;
-        spanEnded = true;
-        span.setAttributes({
-          "http.response.status_code": statusCode,
-          "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
-        });
-        if (statusCode >= 500) {
-          span.setStatus({ code: 2, message: `HTTP ${statusCode}` });
-        }
-        span.end();
-      });
-
-      res.on("error", (err) => {
-        if (spanEnded) return;
-        spanEnded = true;
-        span.recordException(err);
-        span.setStatus({ code: 2, message: err.message });
-        span.end();
-      });
+      wireHttpSpanLifecycle(res, span, () => statusCode, startTime);
     }
 
     // Run request handling inside the HTTP span's active context so any spans
@@ -326,6 +334,8 @@ const httpServer = createHttpServer(async (req, res) => {
         () => handleConfig(req, res, pathSegments, queryParams),
         () => handleFs(req, res, pathSegments, queryParams, myAgentId),
         () => handleKv(req, res, pathSegments, queryParams),
+        () => handleRooms(req, res, pathSegments, queryParams),
+        () => handleRealtimeAsset(req, res),
         () => handleIntegrations(req, res, pathSegments),
         () => handlePromptTemplates(req, res, pathSegments, queryParams),
         () => handleDbQuery(req, res, pathSegments, queryParams),
@@ -403,6 +413,16 @@ const httpServer = createHttpServer(async (req, res) => {
 });
 
 // Store references in globalThis for hot reload persistence
+const detachRealtime = attachRealtimeTransport(httpServer);
+const stopRoomDeletion = realtimeBus.subscribe("room:namespace-deleted", (namespace) => {
+  void Promise.resolve(removeNamespaceRooms(String(namespace))).catch((error) =>
+    console.error("[rooms] Deletion failed:", scrubSecrets(String(error))),
+  );
+});
+globalState.__closeRealtime = () => {
+  detachRealtime();
+  stopRoomDeletion();
+};
 globalState.__httpServer = httpServer;
 globalState.__transports = transports;
 globalState.__transportsUser = transportsUser;
@@ -412,6 +432,7 @@ globalState.__transportActivity = transportActivity;
 globalState.__transportActivityUser = transportActivityUser;
 
 async function shutdown() {
+  globalState.__closeRealtime?.();
   console.log("Shutting down HTTP server...");
   telemetry.server("shutdown", {
     signal: shutdownSignal,
@@ -449,6 +470,9 @@ async function shutdown() {
   // Stop memory expired-row garbage collector
   stopMemoryGc();
 
+  // Stop opt-in session, agent-log, and event retention before closing SQLite.
+  await stopDbRetention();
+
   // Stop scratch-script retention garbage collector
   stopScratchScriptGc();
 
@@ -480,13 +504,14 @@ async function shutdown() {
     delete transportActivityUser[id];
   }
 
-  // Close all active connections forcefully
-  httpServer.closeAllConnections();
-  httpServer.close(() => {
-    closeDb();
-    console.log("MCP HTTP server closed, and database connection closed");
-    process.exit(0);
+  // Drain accepted requests before flushing rooms and closing their database.
+  await new Promise<void>((resolve, reject) => {
+    httpServer.close((error) => (error ? reject(error) : resolve()));
   });
+  await closeRooms();
+  closeDb();
+  console.log("MCP HTTP server closed, and database connection closed");
+  process.exit(0);
 }
 
 // Only register signal handlers once (avoid duplicates on hot reload)
@@ -625,6 +650,9 @@ httpServer
       { generateIfMissing: true },
     );
     telemetry.server("started", { port });
+    if (process.env.GITHUB_TOKEN) {
+      await emitBuiltInIntegrationConnectedOnce("github");
+    }
 
     // Start Slack bot (if configured)
     await startSlackApp();
@@ -692,6 +720,10 @@ httpServer
 
     // Start expired-memory garbage collector (1-hour tick, immediate first run)
     await startMemoryGc();
+
+    // Start the opt-in DB retention sweep after config hydration. Every key is
+    // read on each tick, so config reloads take effect without a restart.
+    await startDbRetention();
 
     // (RBAC audit sink is wired pre-listen — see above httpServer.listen.)
 

@@ -44,6 +44,7 @@ const REPO_ROOT = join(import.meta.dir, "..");
  * file importing one of these counts as gated.
  */
 const GATE_HELPER_SPECIFIERS = [
+  "realtime/auth", // Room tools enforce namespace access through the shared guard.
   "kv-write-auth", // kv-set / kv-delete / kv-incr shared write guard
   "task-tool-ctx", // assertOwnsTask → task.read.own / task.cancel.own / task.action.own
 ];
@@ -72,7 +73,6 @@ const UNGATED_TOOL_FILES: Record<string, string> = {
   "src/tools/list-services.ts": PIN_REASON,
   "src/tools/mcp-servers/mcp-server-get.ts": PIN_REASON,
   "src/tools/mcp-servers/mcp-server-list.ts": PIN_REASON,
-  "src/tools/memory-edit.ts": PIN_REASON,
   "src/tools/memory-get.ts": PIN_REASON,
   "src/tools/memory-rate.ts": PIN_REASON,
   "src/tools/memory-search.ts": PIN_REASON,
@@ -280,7 +280,6 @@ const ROUTE_RBAC_BACKLOG: Record<string, string> = {
   "POST /api/mcp-bridge": BACKLOG_REASON,
   "POST /api/mcp-oauth/{mcpServerId}/manual-client": BACKLOG_REASON,
   "POST /api/mcp-oauth/{mcpServerId}/refresh": BACKLOG_REASON,
-  "POST /api/memory/edit": BACKLOG_REASON,
   "POST /api/memory/index": BACKLOG_REASON,
   "POST /api/memory/list": BACKLOG_REASON,
   "POST /api/memory/rate": BACKLOG_REASON,

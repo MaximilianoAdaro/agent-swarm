@@ -140,6 +140,10 @@ SDK allowlist instead), and HTTP REST routes are generally not gated.
   - [kv-delete](#kv-delete)
   - [kv-incr](#kv-incr)
   - [kv-list](#kv-list)
+  - [room-get](#room-get)
+  - [room-change](#room-change)
+  - [room-reset](#room-reset)
+  - [room-decode](#room-decode)
 - [Slack Tools](#slack-tools)
   - [slack-reply](#slack-reply)
   - [slack-read](#slack-read)
@@ -230,7 +234,7 @@ Returns a list of tasks in the swarm with various filters. Sorted by priority (d
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `status` | `backlog \| unassigned \| offered \| reviewing \| pending \| in_progress \| paused \| completed \| failed \| cancelled \| superseded` | No | - | Filter by task status (unassigned, offered, pending, in_progress, completed, failed). |
+| `status` | `draft \| backlog \| unassigned \| offered \| reviewing \| pending \| in_progress \| paused \| completed \| failed \| cancelled \| superseded` | No | - | Filter by task status (unassigned, offered, pending, in_progress, completed, failed). |
 | `mineOnly` | `boolean` | No | - | Only return tasks assigned to you. |
 | `unassigned` | `boolean` | No | - | Only return unassigned tasks in the pool. |
 | `offeredToMe` | `boolean` | No | - | Only return tasks offered to you (awaiting accept/reject). |
@@ -267,7 +271,8 @@ Sends a task to a specific agent, creates an unassigned task for the pool, or of
 | `offerMode` | `boolean` | No | false | If true, offer the task instead of direct assign (agent must accept/reject). |
 | `taskType` | `string` | No | - | Task type (e.g., 'bug', 'feature', 'review'). |
 | `tags` | `array` | No | - | Tags for filtering (e.g., ['urgent', 'frontend']). |
-| `requiredCapabilities` | `array` | No | - | Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset — only enforced when the pool auto-claim/claim-tool paths check it). Most useful when omitting agentId (unassigned pool task); a no-op for a task with an explicit agentId, which bypasses the pool gate entirely. |
+| `requiredCapabilities` | `array` | No | - | Capabilities required for pool routing. |
+| `leadOnly` | `boolean` | No | false | Structured authorization constraint for merge or other privileged work. Only Lead agents may be assigned, offered, or claim it; never inferred from task text. |
 | `priority` | `number` | No | - | Priority 0-100 (default: 50). |
 | `dependsOn` | `array` | No | - | Task IDs this task depends on. |
 | `parentTaskId` | `uuid` | No | - | Parent task ID for session continuity. Child task will resume the parent's Claude session. Auto-routes to the same worker unless agentId is explicitly provided. |
@@ -283,6 +288,7 @@ Sends a task to a specific agent, creates an unassigned task for the pool, or of
 | `overrideSlackContext` | `boolean` | No | false | Explicitly route this task's Slack updates to a different channel/thread than its parent/contextKey. Requires slackChannelId AND slackThreadTs. Use only for deliberate cross-channel dispatch (e.g. escalation to another human's DM); logged for audit. Without this flag, a slackChannelId/slackThreadTs that disagrees with the parent task or inherited contextKey is rejected — omit the three Slack fields to inherit them from the parent as a unit instead. |
 | `requestedByUserId` | `string` | No | - | ID of the human user who originally requested this task chain. When omitted, inherited from the caller's current task so the attribution flows through multi-hop delegation automatically. |
 | `followUpConfig` | `unknown` | No | - | Control the lead follow-up created when this task finishes. When to use `followUpConfig`: set `disabled: true` when you'll wait for this task to complete inline and no follow-up is needed; set `onCompleted` / `onFailed` with specific instructions when you need to follow up effectively on a particular outcome of a long-running flow; for normal one-shot tasks, leave it unset because defaults are fine. It is most valuable for long-running / complex flows. |
+| `outputSchema` | `object` | No | - | Optional JSON Schema the assignee's final output must satisfy. store-progress rejects a completion that does not match. Supported keywords: type, required, properties, enum, const, items. |
 
 ### get-task-details
 
@@ -442,7 +448,8 @@ Perform task pool operations: create unassigned tasks, claim/release tasks from 
 | `model` | `string` | No | - | Concrete model override for the created task, interpreted by the claiming worker's harness/provider. This does not switch providers. Only used with 'create' action. |
 | `modelTier` | `smol \| regular \| smart \| ultra` | No | - | Portable model tier for the created task: 'smol', 'regular', 'smart', or 'ultra'. Resolved when a worker claims/runs the task. Only used with 'create' action. |
 | `effort` | `off \| low \| medium \| high \| xhigh \| max` | No | - | Reasoning effort for the created task: 'off', 'low', 'medium', 'high', 'xhigh', or 'max'. Only used with 'create' action. |
-| `requiredCapabilities` | `array` | No | - | Capabilities a claiming agent must have (declared via join-swarm/update-profile) to be pool-eligible for this task. Written into the created task's routingAffinity (role is left unset). Only used with 'create' action. |
+| `requiredCapabilities` | `array` | No | - | Capabilities required for pool routing. |
+| `leadOnly` | `boolean` | No | false | Structured authorization constraint: only Lead agents may claim this privileged task. |
 
 ## Config Tools
 
@@ -1040,7 +1047,7 @@ Retrieve the full content of a specific memory by its ID. Use memory-search to f
 
 **Edit a memory**
 
-Edit a single memory in place while preserving its ID, usefulness posterior, and audit history. Two modes: 'replace' overwrites the entire content (requires `content`); 'exact' performs a surgical find-and-replace of `oldString` with `newString` within the existing content (fails if `oldString` is missing or ambiguous). Use 'replace' for full rewrites, 'exact' for targeted edits.
+Edit a single memory in place while preserving its ID, usefulness posterior, and audit history. Two modes: 'replace' overwrites the entire content (requires `content`); 'exact' performs a surgical find-and-replace of `oldString` with `newString` within the existing content (fails if `oldString` is missing or ambiguous). Use 'replace' for full rewrites, 'exact' for targeted edits. Agents can edit their own memories; lead agents can edit any scope.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -1169,7 +1176,7 @@ Create a new automation workflow. Key concepts: - Nodes are linked via 'next' (s
 | `key` | `unknown` | No | - | Logical namespace. Defaults to a shared/workflow:<id>/ resource key. |
 | `description` | `string` | No | - | Description of what this workflow does |
 | `definition` | `unknown` | Yes | - | The workflow definition with nodes (each node has id, type, config, and optional next/retry/validation) |
-| `triggers` | `array` | No | - | Optional trigger configurations (webhook, schedule). Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality. |
+| `triggers` | `array` | No | - | Optional trigger configurations (webhook, schedule, event). Webhook verification formats: legacy omitted verification, hmac-sha256, timestamped-hmac-sha256, token-equality. |
 | `cooldown` | `unknown` | No | - | Optional cooldown configuration to prevent re-triggering too frequently |
 | `input` | `object` | No | - | Optional input values resolved at execution time (env vars like VAR_NAME, secrets secret.NAME, or literals) |
 | `dir` | `string` | No | - | Default working directory for all agent-task nodes (absolute path, e.g. /tmp/workspace) |
@@ -1698,6 +1705,52 @@ List KV entries in the resolved namespace (optionally filtered by key prefix). E
 | `limit` | `number` | No | - | Max entries to return (default 100, max 1000). |
 | `offset` | `number` | No | - | - |
 | `namespace` | `unknown` | No | - | - |
+
+### room-get
+
+**Room Get**
+
+Read the current state of a realtime room.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | "default" | - |
+| `namespace` | `unknown` | No | - | - |
+| `schemaVersion` | `number` | No | 1 | - |
+
+### room-change
+
+**Room Change**
+
+Apply operations to the live state of a realtime room.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | "default" | - |
+| `namespace` | `unknown` | No | - | - |
+| `schemaVersion` | `number` | No | 1 | - |
+
+### room-reset
+
+**Room Reset**
+
+Replace a realtime room with a new state and schema version.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `name` | `string` | No | "default" | - |
+| `namespace` | `unknown` | No | - | - |
+| `schemaVersion` | `number` | No | 1 | - |
+
+### room-decode
+
+**Room Decode**
+
+Decode a room snapshot value that the caller already holds.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `value` | `unknown` | Yes | - | - |
 
 ## Slack Tools
 

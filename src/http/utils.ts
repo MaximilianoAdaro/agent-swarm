@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { getActiveTaskCount } from "../be/db";
+import type { SwarmSpan } from "../otel";
 import { scrubSecrets } from "../utils/secret-scrubber";
 
 export function setCorsHeaders(req: IncomingMessage, res: ServerResponse) {
@@ -47,6 +48,99 @@ export function getPathSegments(url: string): string[] {
   return path.split("/").filter(Boolean);
 }
 
+/**
+ * `http.response.status_code` for a request span whose response connection
+ * closed before completion. `statusCode` initializes to `200` and is only
+ * ever updated by `writeHead` — on the premature-close path that never ran,
+ * so reporting it verbatim would claim a 200 response was sent when none was.
+ * Omitted (not fabricated) when `headersSent` is false.
+ *
+ * Node emits `close` for BOTH a completed response and a connection
+ * terminated early, so this path proves the response did not complete — not
+ * that the client was the actor.
+ */
+export function abortedStatusCodeAttribute(
+  headersSent: boolean,
+  statusCode: number,
+): number | undefined {
+  return headersSent ? statusCode : undefined;
+}
+
+/**
+ * Minimal `ServerResponse` surface `wireHttpSpanLifecycle` needs — narrowed so
+ * tests can pass a plain mock instead of a real Node response.
+ */
+export interface SpanLifecycleResponse {
+  readonly headersSent: boolean;
+  on(event: "finish" | "error" | "close", listener: (err?: Error) => void): unknown;
+}
+
+/**
+ * Wires a request span to its response's terminal events so the span always
+ * ends exactly once, regardless of which event fires first.
+ *
+ * `finish` and `error` are the two ways Node signals a completed response;
+ * `close` additionally fires on a connection that terminates early —
+ * including AFTER `finish` on the happy path, which is why every branch
+ * guards on `spanEnded` before touching the span. Extracted out of
+ * `src/http/index.ts` (which binds a port at module scope and so cannot be
+ * imported directly in a test) so the close-before-finish ordering and the
+ * end-exactly-once guarantee can be exercised with a mocked response/span.
+ */
+export function wireHttpSpanLifecycle(
+  res: SpanLifecycleResponse,
+  span: SwarmSpan,
+  getStatusCode: () => number,
+  startTime: number,
+): void {
+  let spanEnded = false;
+
+  res.on("finish", () => {
+    if (spanEnded) return;
+    spanEnded = true;
+    const statusCode = getStatusCode();
+    span.setAttributes({
+      "http.response.status_code": statusCode,
+      "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
+    });
+    if (statusCode >= 500) {
+      span.setStatus({ code: 2, message: `HTTP ${statusCode}` });
+    }
+    span.end();
+  });
+
+  res.on("error", (err) => {
+    if (spanEnded) return;
+    spanEnded = true;
+    if (err) span.recordException(err);
+    span.setStatus({ code: 2, message: err?.message });
+    span.end();
+  });
+
+  // `close` fires after `finish` on the happy path (the `spanEnded` guard
+  // already covers that), but a response connection that terminates early
+  // fires neither `finish` nor `error` — without this, the span stays open
+  // and is never exported. Verified against Bun 1.4.0 (pinned): `close`
+  // fires on a premature close even with `headersSent === false`; Bun
+  // 1.3.14 never fires it.
+  res.on("close", () => {
+    if (spanEnded) return;
+    spanEnded = true;
+    span.setAttributes({
+      "http.response.status_code": abortedStatusCodeAttribute(res.headersSent, getStatusCode()),
+      "agentswarm.http.duration_ms": Math.round((performance.now() - startTime) * 10) / 10,
+      "agentswarm.http.aborted": true,
+    });
+    // Status left Unset. `close` cannot distinguish an intentional client
+    // cancellation from a response-write failure, and the dominant case
+    // here is the former: a normal SSE teardown on /mcp or /mcp-user.
+    // Marking every premature close ERROR would put that routine traffic
+    // in the service error rate. `agentswarm.http.aborted` carries the
+    // signal instead. Revisit if a discriminator becomes available.
+    span.end();
+  });
+}
+
 export function safeRequestUrlForLog(rawUrl: string | undefined): string {
   if (!rawUrl) return "";
 
@@ -88,14 +182,111 @@ export async function agentWithCapacity<T extends { id: string; maxTasks?: numbe
  * `{}` lets an all-optional body schema accept a bodyless request and turns a
  * required-body schema's failure into the honest 400 its validation produces.
  */
-export async function parseBody<T = unknown>(req: IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(chunk as Buffer);
+export class RequestBodyTooLargeError extends Error {
+  readonly maxBytes: number;
+
+  constructor(maxBytes: number) {
+    super(`Payload too large (max ${maxBytes} bytes)`);
+    this.name = "RequestBodyTooLargeError";
+    this.maxBytes = maxBytes;
   }
-  const raw = Buffer.concat(chunks).toString();
-  if (raw.trim() === "") return {} as T;
-  return JSON.parse(raw) as T;
+}
+
+function requestContentLength(req: IncomingMessage): number | undefined {
+  const raw = req.headers["content-length"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * Parse a JSON request body with an optional byte cap.
+ *
+ * On overflow, the request keeps draining while the caller receives the
+ * rejection. This preserves keep-alive connections for the next request.
+ */
+export async function parseBody<T = unknown>(
+  req: IncomingMessage,
+  maxBytes = Number.POSITIVE_INFINITY,
+): Promise<T> {
+  const contentLength = requestContentLength(req);
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    req.resume();
+    throw new RequestBodyTooLargeError(maxBytes);
+  }
+
+  return await new Promise<T>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("aborted", onAborted);
+      req.off("close", onClose);
+    };
+
+    const rejectTooLarge = () => {
+      if (settled) return;
+      settled = true;
+      reject(new RequestBodyTooLargeError(maxBytes));
+      req.resume();
+    };
+
+    const onData = (chunk: Buffer | string) => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.byteLength;
+      if (totalBytes > maxBytes) {
+        rejectTooLarge();
+        return;
+      }
+      chunks.push(buffer);
+    };
+
+    const onEnd = () => {
+      if (settled) {
+        cleanup();
+        return;
+      }
+      settled = true;
+      cleanup();
+      const raw = Buffer.concat(chunks).toString();
+      if (raw.trim() === "") {
+        resolve({} as T);
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw) as T);
+      } catch (error) {
+        reject(error);
+      }
+    };
+
+    const onError = (error: Error) => {
+      cleanup();
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    };
+
+    const onAborted = () => onError(new Error("Request body was aborted"));
+
+    const onClose = () => {
+      if (!req.readableEnded) onError(new Error("Request body closed before completion"));
+    };
+
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("aborted", onAborted);
+    req.on("close", onClose);
+    req.resume();
+  });
 }
 
 /**
