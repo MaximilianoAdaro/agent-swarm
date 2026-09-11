@@ -15,22 +15,32 @@
 import type { WebClient } from "@slack/web-api";
 import { getTaskAttachments, getTaskById, promoteDraftTask } from "../be/db";
 import { MAX_TASK_ATTACHMENT_BYTES, recordTaskAttachmentUpload } from "../be/task-attachment-store";
+import { providerPath } from "../fs/provider";
 import { getFileStorageProvider } from "../fs/registry";
 import { resolveTemplate } from "../prompts/resolver";
 import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import type { AgentTask, CreateTaskOptions, TaskAttachment } from "../types";
 import { scrubSecrets } from "../utils/secret-scrubber";
+import { taskAttachmentFetchCommand } from "../utils/task-attachment-links";
 import { getFileInfo, type SlackFile } from "./files";
 // Side-effect import: registers all Slack event templates in the in-memory registry
 import "./templates";
 
 const DOWNLOAD_TIMEOUT_MS = 30_000;
-const ATTACHMENT_INTENT = "user-upload";
+/** A file a user sent the bot, like one uploaded from the dashboard composer. */
+const SHARED_FILE_INTENT = "user-upload";
+/** A file an agent pulled from Slack with `slack-download-file` / `slack-read`. */
+const FETCHED_FILE_INTENT = "slack-file";
 const BUFFERED_REASON = "follow-ups queued by ADDITIVE_SLACK carry the file name only";
 
 export type SlackFileFailure = { file: SlackFile; reason: string };
 
 export type AttachedSlackFile = { file: SlackFile; attachment: TaskAttachment };
+
+/** What happened to one file an agent asked to attach: the attachment and how to fetch it, or why not. */
+export type SlackFileOutcome =
+  | { attachment: TaskAttachment; fetchCommand: string }
+  | { reason: string };
 
 export type InboundSlackFiles = {
   /** Every file on the message, with full metadata (resolved via `files.info` when the event omitted it). */
@@ -194,11 +204,15 @@ export async function createSlackTaskWithFiles(
 }
 
 /**
- * Store fetched Slack files as attachments of an existing task. A file whose
- * bytes the task already holds is reused instead of uploaded again. A name
- * another attachment already uses gets the Slack file id as a prefix: the
- * provider key is derived from the name, and pasted screenshots are all called
- * "image.png", so a repeat would overwrite the first blob.
+ * Store fetched Slack files as attachments of a task. `agentId` is the agent
+ * that fetched them, or `null` for files a user sent the bot.
+ *
+ * A file whose bytes the task already holds is reused instead of uploaded
+ * again. Each blob is keyed by its Slack file id, so two different files can
+ * never overwrite each other's bytes — not even from parallel tool calls.
+ * The attachment name stays the file's own, and gets the Slack file id as a
+ * prefix only when another attachment already uses it (pasted screenshots are
+ * all called "image.png"), so fetch commands don't collide in `/tmp` either.
  */
 export async function attachSlackFilesToTask(
   taskId: string,
@@ -221,12 +235,13 @@ export async function attachSlackFilesToTask(
     }
     const name = usedNames.has(file.name) ? `${file.id}-${file.name}` : file.name;
     usedNames.add(name);
-    const scope = { taskId, name };
+    const key = providerPath({ taskId, name: `slack-${file.id}-${file.name}` });
+    const scope = { taskId, name, key };
     try {
       const uploaded = await provider.upload(scope, body, {
         contentType: file.mimetype,
         sizeBytes: body.byteLength,
-        message: `Upload ${name} shared on Slack for task ${taskId}`,
+        message: `Upload ${name} from Slack for task ${taskId}`,
       });
       const attachment = await recordTaskAttachmentUpload({
         provider,
@@ -235,8 +250,10 @@ export async function attachSlackFilesToTask(
         body,
         contentType: file.mimetype,
         agentId,
-        intent: ATTACHMENT_INTENT,
-        description: `Shared on Slack (file ${file.id})`,
+        intent: agentId ? FETCHED_FILE_INTENT : SHARED_FILE_INTENT,
+        description: agentId
+          ? `Fetched from Slack (file ${file.id})`
+          : `Shared on Slack (file ${file.id})`,
       });
       bySha.set(sha256, attachment);
       attached.push({ file, attachment });
@@ -247,6 +264,31 @@ export async function attachSlackFilesToTask(
     }
   }
   return { attached, unattached };
+}
+
+/**
+ * Download Slack files and attach them to `task` on behalf of `agentId`
+ * (`slack-download-file`, `slack-read`). One outcome per Slack file id.
+ */
+export async function attachSlackFilesForAgent(
+  client: WebClient,
+  task: AgentTask,
+  files: SlackFile[],
+  agentId: string,
+): Promise<Map<string, SlackFileOutcome>> {
+  const inbound = await fetchSlackFiles(client, files);
+  const { attached, unattached } = await attachSlackFilesToTask(task.id, inbound.fetched, agentId);
+  const outcomes = new Map<string, SlackFileOutcome>();
+  for (const { file, reason } of [...inbound.failed, ...unattached]) {
+    outcomes.set(file.id, { reason });
+  }
+  for (const { file, attachment } of attached) {
+    outcomes.set(file.id, {
+      attachment,
+      fetchCommand: taskAttachmentFetchCommand(task.id, attachment.id, attachment.name),
+    });
+  }
+  return outcomes;
 }
 
 /**

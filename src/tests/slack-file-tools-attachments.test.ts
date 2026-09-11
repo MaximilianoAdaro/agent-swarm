@@ -18,6 +18,7 @@ import {
 } from "../be/db";
 import { getFileStorageProvider, resetFileStorageProviderForTests } from "../fs/registry";
 import type { SlackFile } from "../slack/files";
+import { createSlackTaskWithFiles, fetchSlackFiles } from "../slack/inbound-files";
 
 const TEST_DB_PATH = "./test-slack-file-tools-attachments.sqlite";
 const BOT_TOKEN = "xoxb-file-tools-test";
@@ -252,7 +253,82 @@ describe("slack-download-file", () => {
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent.savedPath).toBe(`${dir}/screenshot.png`);
     expect(String(result.structuredContent.message)).toContain("on the API server");
+    expect(String(result.structuredContent.nudge)).toContain("not in your container");
     expect(new Uint8Array(await Bun.file(`${dir}/screenshot.png`).arrayBuffer())).toEqual(PNG);
+  });
+
+  test("a source-task header for someone else's task falls back instead of attaching there", async () => {
+    addSlackFile("F0SHOT0001", "screenshot.png", PNG);
+
+    const result = await downloadTool(
+      { fileId: "F0SHOT0001", savePath: `${join(fsDir, "legacy-2")}/` },
+      extra({ "x-source-task-id": othersTaskId }),
+    );
+
+    expect(result.structuredContent.savedPath).toBeDefined();
+    expect(await getTaskAttachments(othersTaskId)).toEqual([]);
+  });
+
+  test("a task the agent created for someone else accepts the file", async () => {
+    addSlackFile("F0SHOT0001", "screenshot.png", PNG);
+    const delegated = await createTaskExtended("delegated", {
+      agentId: OTHER_ID,
+      creatorAgentId: AGENT_ID,
+    });
+
+    const result = await downloadTool({ fileId: "F0SHOT0001", taskId: delegated.id }, extra({}));
+
+    expect(result.isError).toBeFalsy();
+    const [attachment] = await getTaskAttachments(delegated.id);
+    expect(attachment).toMatchObject({ intent: "slack-file", agentId: AGENT_ID });
+  });
+
+  test("a URL that names no Slack file can't be attached", async () => {
+    const result = await downloadTool(
+      { url: `${host.url}elsewhere/some.png` },
+      extra({ "x-source-task-id": taskId }),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(String(result.structuredContent.message)).toContain("pass fileId");
+  });
+
+  test("the file a user already sent the bot is reused, not stored again", async () => {
+    const file = addSlackFile("F0SHOT0001", "screenshot.png", PNG);
+    const inbound = await fetchSlackFiles({ token: BOT_TOKEN } as never, [file]);
+    const { task } = await createSlackTaskWithFiles("from Slack", { agentId: AGENT_ID }, inbound);
+    const [shared] = await getTaskAttachments(task.id);
+
+    const result = await downloadTool(
+      { fileId: "F0SHOT0001" },
+      extra({ "x-source-task-id": task.id }),
+    );
+
+    expect(result.structuredContent.attachmentId).toBe(shared!.id);
+    expect(await getTaskAttachments(task.id)).toHaveLength(1);
+  });
+
+  test("parallel downloads of different files with the same name keep both blobs intact", async () => {
+    addSlackFile("F0IMAGE001", "image.png", PNG);
+    addSlackFile("F0IMAGE002", "image.png", PNG_2);
+
+    await Promise.all([
+      downloadTool({ fileId: "F0IMAGE001" }, extra({ "x-source-task-id": taskId })),
+      downloadTool({ fileId: "F0IMAGE002" }, extra({ "x-source-task-id": taskId })),
+    ]);
+
+    const attachments = await getTaskAttachments(taskId);
+    expect(attachments).toHaveLength(2);
+    const provider = getFileStorageProvider();
+    const stored = await Promise.all(
+      attachments.map(async (a) => {
+        const res = await provider.download({ taskId, name: a.name, key: a.providerKey });
+        return { sha: a.sha256, bytes: new Uint8Array(await res.arrayBuffer()) };
+      }),
+    );
+    for (const { sha, bytes } of stored) {
+      expect(new Bun.CryptoHasher("sha256").update(bytes).digest("hex")).toBe(sha!);
+    }
   });
 });
 

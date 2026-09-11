@@ -5,10 +5,10 @@ import { can } from "@/rbac";
 import { getSlackApp } from "@/slack/app";
 import { withAutoJoin } from "@/slack/channel-join";
 import { downloadFile, type SlackFile } from "@/slack/files";
-import { attachableTask, attachSlackFilesToTask, fetchSlackFiles } from "@/slack/inbound-files";
+import { attachableTask, attachSlackFilesForAgent } from "@/slack/inbound-files";
 import { extractSlackMessageText } from "@/slack/message-text";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
-import { taskAttachmentFetchCommand } from "@/utils/task-attachment-links";
+import type { AgentTask } from "@/types";
 
 /**
  * Where files are auto-downloaded when there is no task to attach them to.
@@ -27,7 +27,10 @@ const SlackFileSchema = z.looseObject({
   attachmentId: z.string().optional(),
   fetchCommand: z.string().optional(),
   notAttached: z.string().optional(),
-  localPath: z.string().optional(),
+  localPath: z
+    .string()
+    .optional()
+    .describe("Only without a task: the path on the API server's disk, not in your container."),
 });
 
 const SlackMessageSchema = z.looseObject({
@@ -46,7 +49,8 @@ export const registerSlackReadTool = (server: McpServer) => {
       title: "Read Slack thread/channel history",
       description:
         "Read messages from a Slack thread or channel. Use inboxMessageId or taskId to read from a thread you have context for, or provide channelId directly for channel history (leads only). From a task, files in the messages are stored as attachments of that task, each with a ready-to-run `fetchCommand`.",
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      // Not read-only: from a task it uploads the thread's files as attachments.
+      annotations: { readOnlyHint: false, openWorldHint: true },
 
       inputSchema: z.object({
         inboxMessageId: z.uuid().optional().describe("Read thread history for an inbox message."),
@@ -95,6 +99,7 @@ export const registerSlackReadTool = (server: McpServer) => {
 
       let slackChannelId: string | undefined = channelId;
       let slackThreadTs: string | undefined = threadTs;
+      let contextTask: AgentTask | null = null;
 
       // Determine Slack context from inbox message or task
       if (inboxMessageId) {
@@ -118,6 +123,7 @@ export const registerSlackReadTool = (server: McpServer) => {
         }
         slackChannelId = task.slackChannelId;
         slackThreadTs = task.slackThreadTs;
+        contextTask = task;
       } else if (channelId) {
         // Direct channel access requires lead privileges
         const decision = can({
@@ -218,7 +224,11 @@ export const registerSlackReadTool = (server: McpServer) => {
         const token = process.env.SLACK_BOT_TOKEN;
 
         // Files go to the calling task's attachments; without one, to the API disk.
-        const attachTo = await attachableTask(agent.id, taskId ?? requestInfo.sourceTaskId);
+        const attachTo =
+          contextTask ?? (await attachableTask(agent.id, taskId ?? requestInfo.sourceTaskId));
+        if (taskId && !attachTo) {
+          return toolErr("You don't have context for this task.", { data: { messages: [] } });
+        }
 
         type FileInfo = {
           id: string;
@@ -308,30 +318,19 @@ export const registerSlackReadTool = (server: McpServer) => {
         }
 
         if (attachTo && toAttach.length > 0) {
-          const inbound = await fetchSlackFiles(
+          const outcomes = await attachSlackFilesForAgent(
             client,
+            attachTo,
             toAttach.map(({ raw }) => raw as SlackFile),
-          );
-          const { attached, unattached } = await attachSlackFilesToTask(
-            attachTo.id,
-            inbound.fetched,
             agent.id,
           );
-          const attachmentsById = new Map(attached.map((a) => [a.file.id, a.attachment]));
-          const reasonsById = new Map(
-            [...inbound.failed, ...unattached].map((f) => [f.file.id, f.reason]),
-          );
           for (const { info } of toAttach) {
-            const attachment = attachmentsById.get(info.id);
-            if (attachment) {
-              info.attachmentId = attachment.id;
-              info.fetchCommand = taskAttachmentFetchCommand(
-                attachTo.id,
-                attachment.id,
-                attachment.name,
-              );
+            const outcome = outcomes.get(info.id);
+            if (outcome && "attachment" in outcome) {
+              info.attachmentId = outcome.attachment.id;
+              info.fetchCommand = outcome.fetchCommand;
             } else {
-              info.notAttached = reasonsById.get(info.id) ?? "not downloaded";
+              info.notAttached = outcome?.reason ?? "not downloaded";
             }
           }
         }
@@ -349,7 +348,7 @@ export const registerSlackReadTool = (server: McpServer) => {
                   } else if (f.notAttached) {
                     line += ` [Not attached: ${f.notAttached}]`;
                   } else if (f.localPath) {
-                    line += ` [Downloaded on the API server, not in your container: ${f.localPath}]`;
+                    line += ` [Downloaded on the API server: ${f.localPath}]`;
                   }
                   return line;
                 })

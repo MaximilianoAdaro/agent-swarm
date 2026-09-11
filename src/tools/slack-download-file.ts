@@ -2,10 +2,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import { getAgentById } from "@/be/db";
 import { getSlackApp } from "@/slack/app";
-import { DEFAULT_DOWNLOAD_DIR, downloadFile, getFileInfo, type SlackFile } from "@/slack/files";
-import { attachableTask, attachSlackFilesToTask, fetchSlackFiles } from "@/slack/inbound-files";
+import { DEFAULT_DOWNLOAD_DIR, downloadFile, getFileInfo } from "@/slack/files";
+import { attachableTask, attachSlackFilesForAgent } from "@/slack/inbound-files";
 import { createToolRegistrar, swarmToolOutputSchema, toolErr, toolOk } from "@/tools/utils";
-import { taskAttachmentFetchCommand } from "@/utils/task-attachment-links";
 
 /** `F0123ABCD` out of a `files.slack.com/files-pri/<team>-<file>/…` URL. */
 function fileIdFromUrl(url: string): string | undefined {
@@ -19,7 +18,8 @@ export const registerSlackDownloadFileTool = (server: McpServer) => {
       title: "Download file from Slack",
       description:
         "Download a file from Slack by file ID or URL. From a task, the file is stored as an attachment of that task and the result carries a ready-to-run `fetchCommand` to get the bytes into your container. Without a task, the file is saved on the API server's disk, which your container usually can't read.",
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      // Not read-only: from a task it uploads the file and records an attachment.
+      annotations: { readOnlyHint: false, openWorldHint: true },
 
       inputSchema: z.object({
         fileId: z
@@ -52,7 +52,12 @@ export const registerSlackDownloadFileTool = (server: McpServer) => {
         taskId: z.string().optional(),
         attachmentId: z.string().optional(),
         fetchCommand: z.string().optional(),
-        savedPath: z.string().optional(),
+        savedPath: z
+          .string()
+          .optional()
+          .describe(
+            "Only without a task: the path on the API server's disk, not in your container.",
+          ),
         fileInfo: z
           .looseObject({
             id: z.string().optional(),
@@ -104,39 +109,21 @@ export const registerSlackDownloadFileTool = (server: McpServer) => {
           : undefined;
 
         if (task) {
-          const file: SlackFile = info ?? {
-            id: id ?? "url",
-            name: filename ?? `file_${Date.now()}`,
-            mimetype: "application/octet-stream",
-            filetype: "",
-            size: 0,
-            url_private: url ?? "",
-            url_private_download: url ?? "",
-          };
-          const inbound = await fetchSlackFiles(app.client, [file]);
-          const [failure] = inbound.failed;
-          if (failure) {
-            return toolErr(`Failed to download file: ${failure.reason}`);
+          if (!info) {
+            return toolErr("Could not identify the Slack file in that URL; pass fileId instead.");
           }
-          const { attached, unattached } = await attachSlackFilesToTask(
-            task.id,
-            inbound.fetched,
-            agent.id,
+          const outcome = (await attachSlackFilesForAgent(app.client, task, [info], agent.id)).get(
+            info.id,
           );
-          const [stored] = attached;
-          if (!stored) {
-            return toolErr(`Failed to store file: ${unattached[0]?.reason ?? "unknown error"}`);
+          if (!outcome || "reason" in outcome) {
+            return toolErr(`Failed to attach file: ${outcome?.reason ?? "unknown error"}`);
           }
-          const fetchCommand = taskAttachmentFetchCommand(
-            task.id,
-            stored.attachment.id,
-            stored.attachment.name,
-          );
+          const { attachment, fetchCommand } = outcome;
           return toolOk(
-            `Attached ${stored.attachment.name} to task ${task.id} (attachment ${stored.attachment.id}).`,
+            `Attached ${attachment.name} to task ${task.id} (attachment ${attachment.id}).`,
             {
               details: `Get it into your container with:\n${fetchCommand}`,
-              data: { taskId: task.id, attachmentId: stored.attachment.id, fetchCommand, fileInfo },
+              data: { taskId: task.id, attachmentId: attachment.id, fetchCommand, fileInfo },
             },
           );
         }
@@ -168,8 +155,9 @@ export const registerSlackDownloadFileTool = (server: McpServer) => {
           return toolErr(`Failed to download file: ${result.error}`);
         }
 
-        const successMsg = `File saved on the API server at ${result.savedPath}. That path is on the API server's disk, not in your container; call this from a task (or pass taskId) to get the file as a task attachment you can fetch.`;
-        return toolOk(successMsg, { data: { savedPath: result.savedPath, fileInfo } });
+        return toolOk(`File saved on the API server at ${result.savedPath}.`, {
+          data: { savedPath: result.savedPath, fileInfo },
+        });
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         return toolErr(`Failed to download file: ${errorMsg}`);
