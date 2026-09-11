@@ -1,3 +1,5 @@
+import { taskAttachmentFetchCommand } from "../utils/task-attachment-links.ts";
+
 /**
  * Build a ready-to-run fetch recipe for each task attachment, so the agent
  * can download the bytes in one call via the provider-agnostic
@@ -24,8 +26,7 @@ export function buildAttachmentsSection(
       ]
         .filter(Boolean)
         .join(", ");
-      const url = `$MCP_BASE_URL/api/fs/tasks/${taskId}/files/${id}/raw`;
-      const cmd = `curl -s -H "Authorization: Bearer \${AGENT_SWARM_API_KEY:-$API_KEY}" -H "X-Agent-ID: $AGENT_ID" "${url}" -o /tmp/${name}`;
+      const cmd = taskAttachmentFetchCommand(taskId, id, name);
       return `- ${name}${details ? ` (${details})` : ""}: \`${cmd}\``;
     })
     .filter((line): line is string => line !== null);
