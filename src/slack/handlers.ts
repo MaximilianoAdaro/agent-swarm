@@ -9,13 +9,19 @@ import {
 } from "../be/db";
 import { resolveTemplate } from "../prompts/resolver";
 import { slackContextKey } from "../tasks/context-key";
-import { createTaskWithSiblingAwareness } from "../tasks/sibling-awareness";
 import { workflowEventBus } from "../workflows/event-bus";
 import { ackSlackMessage, reactionName } from "./ack";
 import { buildTreeBlocks, type TreeNode } from "./blocks";
 import { enrichSlackUserEmail, resolveSlackUserId, rewriteSlackMentions } from "./enrich";
 import { wasEventSeen } from "./event-dedup";
 import type { SlackFile } from "./files";
+import {
+  buildEffectiveText,
+  createSlackTaskWithFiles,
+  fetchSlackFiles,
+  notifySlackFileFailures,
+  type SlackFileFailure,
+} from "./inbound-files";
 import { extractTaskFromMessage, hasOtherUserMention, routeMessage } from "./router";
 // Side-effect import: registers all Slack event templates in the in-memory registry
 import "./templates";
@@ -336,45 +342,6 @@ async function getThreadContext(
   }
 }
 
-/**
- * Format a file size in bytes to a human-readable string.
- */
-export function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-/**
- * Build a text representation of file attachments for inclusion in messages.
- * Each file is formatted as: [File: filename.ext (mimetype, size) id=FILE_ID]
- */
-export function buildAttachmentText(files: SlackFile[]): string {
-  return files
-    .map((f) => `[File: ${f.name} (${f.mimetype}, ${formatFileSize(f.size)}) id=${f.id}]`)
-    .join("\n");
-}
-
-/**
- * Build the effective message text from the original text and any file attachments.
- * - Text only: returns the text as-is
- * - Files only: returns the attachment metadata
- * - Both: returns text followed by attachment metadata
- */
-export function buildEffectiveText(text: string | undefined, files?: SlackFile[]): string {
-  const hasText = !!text?.trim();
-  const hasFiles = files && files.length > 0;
-
-  if (hasText && hasFiles) {
-    return `${text}\n\n${buildAttachmentText(files)}`;
-  }
-  if (hasFiles) {
-    return buildAttachmentText(files);
-  }
-  return text || "";
-}
-
 // Message deduplication (prevents duplicate event processing)
 const processedMessages = new Set<string>();
 const MESSAGE_DEDUP_TTL = 60_000; // 1 minute
@@ -501,9 +468,11 @@ export function registerMessageHandler(app: App): void {
     // Check if bot was mentioned (in original text only)
     const botMentioned = !!msg.text?.includes(`<@${botUserId}>`);
 
-    // Detect assistant thread context — file_share messages in DM assistant threads
-    // bypass the assistant handler and land here instead. Treat them as implicit mentions
-    // so they route to the lead agent rather than being silently dropped.
+    // Detect assistant thread context. Bolt's Assistant middleware claims DM thread
+    // messages with no subtype or `file_share` (`isAssistantMessage` in @slack/bolt), so
+    // those — file uploads included — are handled in assistant.ts. An assistant-thread
+    // message that still lands here is treated as an implicit mention so it routes to
+    // the lead agent rather than being silently dropped.
     // Guard: suppress implicit mention when the message @-mentions someone else but NOT us —
     // those messages are addressed to a different agent/user (e.g. Devin) and must not spawn.
     const isAssistantThread = !!msg.assistant_thread;
@@ -602,9 +571,11 @@ export function registerMessageHandler(app: App): void {
         return;
       }
 
+      const inbound = await fetchSlackFiles(client, msg.files);
+      const taskText = buildEffectiveText(msg.text, inbound.files, inbound.failed);
       const taskDescription = isImplicitMention
-        ? effectiveText
-        : extractTaskFromMessage(effectiveText, botUserId);
+        ? taskText
+        : extractTaskFromMessage(taskText, botUserId);
       if (!taskDescription) {
         if (!isImplicitMention && !isSlackRenderV2Enabled()) {
           await say({
@@ -634,17 +605,25 @@ export function registerMessageHandler(app: App): void {
       }
 
       const lead = await getLeadAgent();
-      const task = await createTaskWithSiblingAwareness(fullTaskDescription, {
-        agentId: lead?.id,
-        source: "slack",
-        slackChannelId: msg.channel,
-        slackThreadTs: threadTs,
-        slackTriggerMessageTs: msg.ts,
-        slackUserId: msg.user,
-        requestedByUserId,
-        contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
-      });
+      const { task, failed: unstoredFiles } = await createSlackTaskWithFiles(
+        fullTaskDescription,
+        {
+          agentId: lead?.id,
+          source: "slack",
+          slackChannelId: msg.channel,
+          slackThreadTs: threadTs,
+          slackTriggerMessageTs: msg.ts,
+          slackUserId: msg.user,
+          requestedByUserId,
+          contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
+        },
+        inbound,
+      );
       await ackSlackMessage(client, msg.channel, msg.ts, reactionName("accepted"), "accepted");
+      await notifySlackFileFailures(client, msg.channel, threadTs, [
+        ...inbound.failed,
+        ...unstoredFiles,
+      ]);
 
       if (isSlackRenderV2Enabled()) {
         await ensureSlackThreadTree([task.id]);
@@ -668,8 +647,12 @@ export function registerMessageHandler(app: App): void {
       return;
     }
 
-    // Extract task description (using effective text which includes attachment metadata)
-    const taskDescription = extractTaskFromMessage(effectiveText, botUserId);
+    // Extract task description (the text plus a `[File: …]` line per attachment)
+    const inbound = await fetchSlackFiles(client, msg.files);
+    const taskDescription = extractTaskFromMessage(
+      buildEffectiveText(msg.text, inbound.files, inbound.failed),
+      botUserId,
+    );
     if (!taskDescription) {
       if (!isSlackRenderV2Enabled()) {
         await say({
@@ -706,6 +689,7 @@ export function registerMessageHandler(app: App): void {
       steered: Array<{ agentName: string; acknowledgement: string }>;
       failed: Array<{ agentName: string; reason: string }>;
     } = { assigned: [], queued: [], steered: [], failed: [] };
+    const unstoredFiles: SlackFileFailure[] = [];
 
     for (const match of matches) {
       const agent = await getAgentById(match.agent.id);
@@ -718,15 +702,18 @@ export function registerMessageHandler(app: App): void {
       try {
         const latestTask = await getMostRecentTaskInThread(msg.channel, threadTs);
         if (agent.isLead) {
-          const steering = msg.thread_ts
-            ? await requestSlackThreadSteering({
-                channelId: msg.channel,
-                threadTs,
-                message: taskDescription,
-                messageTimestamps: [msg.ts],
-                requestedByUserId,
-              })
-            : null;
+          // Steering only carries text into the running session; a message with
+          // files becomes a follow-up task so the files land as attachments.
+          const steering =
+            msg.thread_ts && inbound.files.length === 0
+              ? await requestSlackThreadSteering({
+                  channelId: msg.channel,
+                  threadTs,
+                  message: taskDescription,
+                  messageTimestamps: [msg.ts],
+                  requestedByUserId,
+                })
+              : null;
           if (steering) {
             await ackSlackMessage(client, msg.channel, msg.ts, reactionName("steered"), "steered");
             results.steered.push({
@@ -736,33 +723,43 @@ export function registerMessageHandler(app: App): void {
             continue;
           }
 
-          const task = await createTaskWithSiblingAwareness(fullTaskDescription, {
-            agentId: agent.id,
-            source: "slack",
-            slackChannelId: msg.channel,
-            slackThreadTs: threadTs,
-            slackTriggerMessageTs: msg.ts,
-            slackUserId: msg.user,
-            parentTaskId: latestTask?.id,
-            requestedByUserId,
-            contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
-          });
+          const { task, failed } = await createSlackTaskWithFiles(
+            fullTaskDescription,
+            {
+              agentId: agent.id,
+              source: "slack",
+              slackChannelId: msg.channel,
+              slackThreadTs: threadTs,
+              slackTriggerMessageTs: msg.ts,
+              slackUserId: msg.user,
+              parentTaskId: latestTask?.id,
+              requestedByUserId,
+              contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
+            },
+            inbound,
+          );
+          unstoredFiles.push(...failed);
           await ackSlackMessage(client, msg.channel, msg.ts, reactionName("accepted"), "accepted");
           results.assigned.push({ agentName: agent.name, taskId: task.id });
           continue;
         }
 
         // Workers receive tasks as before
-        const task = await createTaskWithSiblingAwareness(fullTaskDescription, {
-          agentId: agent.id,
-          source: "slack",
-          slackChannelId: msg.channel,
-          slackThreadTs: threadTs,
-          slackTriggerMessageTs: msg.ts,
-          slackUserId: msg.user,
-          requestedByUserId,
-          contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
-        });
+        const { task, failed } = await createSlackTaskWithFiles(
+          fullTaskDescription,
+          {
+            agentId: agent.id,
+            source: "slack",
+            slackChannelId: msg.channel,
+            slackThreadTs: threadTs,
+            slackTriggerMessageTs: msg.ts,
+            slackUserId: msg.user,
+            requestedByUserId,
+            contextKey: slackContextKey({ channelId: msg.channel, threadTs }),
+          },
+          inbound,
+        );
+        unstoredFiles.push(...failed);
         await ackSlackMessage(client, msg.channel, msg.ts, reactionName("accepted"), "accepted");
 
         // Check if agent has an in-progress task in this thread (queued follow-up)
@@ -779,6 +776,13 @@ export function registerMessageHandler(app: App): void {
       } catch {
         results.failed.push({ agentName: agent.name, reason: "error" });
       }
+    }
+
+    if (results.assigned.length + results.queued.length > 0) {
+      await notifySlackFileFailures(client, msg.channel, threadTs, [
+        ...inbound.failed,
+        ...unstoredFiles,
+      ]);
     }
 
     // Send consolidated summary as initial tree with Block Kit
