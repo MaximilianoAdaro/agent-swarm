@@ -6078,8 +6078,45 @@ export async function updateAgentProfile(
       }
     }
 
+    // `session_sync` is the automatic file→DB echo at session end (Stop hook /
+    // runner batch). Its source file is whatever the LAST session materialized
+    // from the DB, so with overlapping sessions — or after the Stop hook restores
+    // `~/.claude/CLAUDE.md.bak` — it can carry a value the DB has already moved
+    // past. Measured 2026-09-11: three consecutive `self_edit`s of a Lead's
+    // claudeMd were each reverted 8–27 s later by a `session_sync` whose content
+    // was byte-for-byte the previous version. A field that already sits in its
+    // own history is an echo, never an edit: drop it (no version, no column
+    // write). Explicit sources (`self_edit`, `api`, `system`) stay free to revert.
+    //
+    // Runs BEFORE the budget check: a stale echo of an older, longer value must
+    // be dropped, not rejected — a budget rejection throws and would also roll
+    // back the genuinely new fields of the same sync.
+    const effective = { ...updates };
+    if (meta?.changeSource === "session_sync") {
+      for (const field of VERSIONABLE_FIELDS) {
+        const newValue = effective[field];
+        if (newValue === undefined || newValue === null) continue;
+
+        const newHash = computeContentHash(newValue);
+        if (newHash === computeContentHash(current[field] ?? "")) continue; // no-op anyway
+
+        const echoed = await tx.get<{ version: number }>(
+          `SELECT version FROM context_versions
+            WHERE agentId = ? AND field = ? AND contentHash = ?
+            ORDER BY version DESC LIMIT 1`,
+          [id, field, newHash],
+        );
+        if (echoed) {
+          console.warn(
+            `[profile-sync] agent ${id}: session_sync for ${field} carries superseded version ${echoed.version} — stale echo ignored`,
+          );
+          delete effective[field];
+        }
+      }
+    }
+
     for (const field of BUDGETED_IDENTITY_FIELDS) {
-      const nextValue = updates[field];
+      const nextValue = effective[field];
       if (nextValue === undefined) continue;
 
       const result = checkIdentityFieldBudget({
@@ -6104,9 +6141,9 @@ export async function updateAgentProfile(
       if (existingAgent) throw new Error("Agent name already exists");
     }
 
-    // Create context versions for changed fields
+    // Create context versions for changed fields (stale echoes already dropped)
     for (const field of VERSIONABLE_FIELDS) {
-      const newValue = updates[field];
+      const newValue = effective[field];
       if (newValue === undefined || newValue === null) continue;
 
       const currentValue = current[field] ?? "";
@@ -6163,12 +6200,12 @@ export async function updateAgentProfile(
         updates.description ?? null,
         updates.role ?? null,
         updates.capabilities ? JSON.stringify(updates.capabilities) : null,
-        updates.claudeMd ?? null,
-        updates.soulMd ?? null,
-        updates.identityMd ?? null,
-        updates.setupScript ?? null,
-        updates.toolsMd ?? null,
-        updates.heartbeatMd ?? null,
+        effective.claudeMd ?? null,
+        effective.soulMd ?? null,
+        effective.identityMd ?? null,
+        effective.setupScript ?? null,
+        effective.toolsMd ?? null,
+        effective.heartbeatMd ?? null,
         avatarProvided ? 1 : 0,
         avatarJson,
         now,

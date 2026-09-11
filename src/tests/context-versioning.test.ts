@@ -10,6 +10,7 @@ import {
   initDb,
   updateAgentProfile,
 } from "../be/db";
+import { IDENTITY_FIELD_BUDGETS } from "../utils/identity-field-budget";
 
 const TEST_DB_PATH = "./test-context-versioning.sqlite";
 
@@ -408,6 +409,115 @@ describe("Context Versioning", () => {
       // We can't test seeding directly since it ran at initDb time with empty agents
       // But we verify the function doesn't crash on agents with null fields
       expect(history).toBeInstanceOf(Array);
+    });
+  });
+
+  // ============================================================================
+  // session_sync stale-echo guard
+  // ============================================================================
+
+  describe("session_sync stale-echo guard", () => {
+    const echoAgentId = "cccc0000-0000-4000-8000-000000000004";
+    const v1 = "# CLAUDE.md\n\nversion one — written by the Lead";
+    const v2 = "# CLAUDE.md\n\nversion two — the Lead added the triage rule";
+    const v3 = "# CLAUDE.md\n\nversion three — a genuine edit made in-session";
+
+    beforeAll(async () => {
+      await createAgent({ id: echoAgentId, name: "Echo Agent", isLead: false, status: "idle" });
+      await updateAgentProfile(echoAgentId, { claudeMd: v1 }, { changeSource: "self_edit" });
+      await updateAgentProfile(echoAgentId, { claudeMd: v2 }, { changeSource: "self_edit" });
+    });
+
+    test("ignores a session_sync whose content is a superseded version", async () => {
+      // The shape of the 2026-09-11 incident: a concurrent session (or the
+      // restored ~/.claude/CLAUDE.md.bak) syncs the copy it materialized from
+      // the DB before the Lead's self_edit landed.
+      const agent = await updateAgentProfile(
+        echoAgentId,
+        { claudeMd: v1 },
+        { changeSource: "session_sync" },
+      );
+
+      expect(agent).not.toBeNull();
+      expect(agent!.claudeMd).toBe(v2);
+
+      const latest = await getLatestContextVersion(echoAgentId, "claudeMd");
+      expect(latest!.version).toBe(2);
+      expect(latest!.content).toBe(v2);
+    });
+
+    test("still applies a session_sync carrying content never seen before", async () => {
+      const agent = await updateAgentProfile(
+        echoAgentId,
+        { claudeMd: v3 },
+        { changeSource: "session_sync" },
+      );
+
+      expect(agent!.claudeMd).toBe(v3);
+      const latest = await getLatestContextVersion(echoAgentId, "claudeMd");
+      expect(latest!.version).toBe(3);
+      expect(latest!.changeSource).toBe("session_sync");
+    });
+
+    test("an explicit source may still revert to an older version", async () => {
+      const agent = await updateAgentProfile(
+        echoAgentId,
+        { claudeMd: v1 },
+        { changeSource: "self_edit" },
+      );
+
+      expect(agent!.claudeMd).toBe(v1);
+      const latest = await getLatestContextVersion(echoAgentId, "claudeMd");
+      expect(latest!.version).toBe(4);
+    });
+
+    test("the echo guard is per field: other fields in the same update still land", async () => {
+      // claudeMd echoes v2 (superseded, the column holds v1 now); soulMd is new.
+      const soul = "s".repeat(600);
+      const agent = await updateAgentProfile(
+        echoAgentId,
+        { claudeMd: v2, soulMd: soul },
+        { changeSource: "session_sync" },
+      );
+
+      expect(agent!.claudeMd).toBe(v1);
+      expect(agent!.soulMd).toBe(soul);
+      expect((await getLatestContextVersion(echoAgentId, "claudeMd"))!.version).toBe(4);
+      expect((await getLatestContextVersion(echoAgentId, "soulMd"))!.version).toBe(1);
+    });
+
+    test("a stale echo over the budget is dropped, not rejected", async () => {
+      // The profile was once longer than today's budget and has since been
+      // shortened. Replaying that old value must be ignored like any echo —
+      // not throw IdentityFieldBudgetError and roll back the fresh fields too.
+      const longAgentId = "cccc0000-0000-4000-8000-000000000005";
+      const oversized = "x".repeat(IDENTITY_FIELD_BUDGETS.claudeMd + 500);
+      const shortened = "# CLAUDE.md\n\nshortened below the budget";
+      await createAgent({
+        id: longAgentId,
+        name: "Long Echo Agent",
+        isLead: false,
+        status: "idle",
+      });
+      await createContextVersion({
+        agentId: longAgentId,
+        field: "claudeMd",
+        content: oversized,
+        version: 1,
+        changeSource: "self_edit",
+        contentHash: sha256(oversized),
+      });
+      await updateAgentProfile(longAgentId, { claudeMd: shortened }, { changeSource: "self_edit" });
+
+      const soul = "t".repeat(600);
+      const agent = await updateAgentProfile(
+        longAgentId,
+        { claudeMd: oversized, soulMd: soul },
+        { changeSource: "session_sync" },
+      );
+
+      expect(agent!.claudeMd).toBe(shortened);
+      expect(agent!.soulMd).toBe(soul);
     });
   });
 
