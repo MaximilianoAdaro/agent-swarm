@@ -16,6 +16,7 @@ import { enrichSlackUserEmail, resolveSlackUserId, rewriteSlackMentions } from "
 import { wasEventSeen } from "./event-dedup";
 import type { SlackFile } from "./files";
 import {
+  bufferedFileFailures,
   buildEffectiveText,
   createSlackTaskWithFiles,
   fetchSlackFiles,
@@ -532,7 +533,15 @@ export function registerMessageHandler(app: App): void {
 
       if (hasSwarmActivity) {
         const threadKey = `${msg.channel}:${msg.thread_ts}`;
-        bufferThreadMessage(msg.channel, msg.thread_ts, effectiveText, msg.user, msg.ts);
+        // Buffered follow-ups carry the `[File: …]` lines only; their files are not attached.
+        const unattached = bufferedFileFailures(msg.files);
+        bufferThreadMessage(
+          msg.channel,
+          msg.thread_ts,
+          buildEffectiveText(msg.text, msg.files, unattached),
+          msg.user,
+          msg.ts,
+        );
 
         // Slack feedback: react with the accepted reaction on first buffer, buffered on appends
         const count = getBufferMessageCount(threadKey);
@@ -540,6 +549,7 @@ export function registerMessageHandler(app: App): void {
         const name = reactionName(event);
         console.log(`[Slack] Additive buffer: ${threadKey} (message #${count}, reaction: ${name})`);
         await ackSlackMessage(client, msg.channel, msg.ts, name, event);
+        await notifySlackFileFailures(client, msg.channel, msg.thread_ts, unattached);
 
         return; // Don't process further — buffer will flush
       }
@@ -605,7 +615,7 @@ export function registerMessageHandler(app: App): void {
       }
 
       const lead = await getLeadAgent();
-      const { task, failed: unstoredFiles } = await createSlackTaskWithFiles(
+      const { task, unattached } = await createSlackTaskWithFiles(
         fullTaskDescription,
         {
           agentId: lead?.id,
@@ -620,10 +630,7 @@ export function registerMessageHandler(app: App): void {
         inbound,
       );
       await ackSlackMessage(client, msg.channel, msg.ts, reactionName("accepted"), "accepted");
-      await notifySlackFileFailures(client, msg.channel, threadTs, [
-        ...inbound.failed,
-        ...unstoredFiles,
-      ]);
+      await notifySlackFileFailures(client, msg.channel, threadTs, unattached);
 
       if (isSlackRenderV2Enabled()) {
         await ensureSlackThreadTree([task.id]);
@@ -689,7 +696,7 @@ export function registerMessageHandler(app: App): void {
       steered: Array<{ agentName: string; acknowledgement: string }>;
       failed: Array<{ agentName: string; reason: string }>;
     } = { assigned: [], queued: [], steered: [], failed: [] };
-    const unstoredFiles: SlackFileFailure[] = [];
+    const unattached: SlackFileFailure[] = [];
 
     for (const match of matches) {
       const agent = await getAgentById(match.agent.id);
@@ -723,7 +730,7 @@ export function registerMessageHandler(app: App): void {
             continue;
           }
 
-          const { task, failed } = await createSlackTaskWithFiles(
+          const created = await createSlackTaskWithFiles(
             fullTaskDescription,
             {
               agentId: agent.id,
@@ -738,14 +745,15 @@ export function registerMessageHandler(app: App): void {
             },
             inbound,
           );
-          unstoredFiles.push(...failed);
+          const { task } = created;
+          unattached.push(...created.unattached);
           await ackSlackMessage(client, msg.channel, msg.ts, reactionName("accepted"), "accepted");
           results.assigned.push({ agentName: agent.name, taskId: task.id });
           continue;
         }
 
         // Workers receive tasks as before
-        const { task, failed } = await createSlackTaskWithFiles(
+        const created = await createSlackTaskWithFiles(
           fullTaskDescription,
           {
             agentId: agent.id,
@@ -759,7 +767,8 @@ export function registerMessageHandler(app: App): void {
           },
           inbound,
         );
-        unstoredFiles.push(...failed);
+        const { task } = created;
+        unattached.push(...created.unattached);
         await ackSlackMessage(client, msg.channel, msg.ts, reactionName("accepted"), "accepted");
 
         // Check if agent has an in-progress task in this thread (queued follow-up)
@@ -779,10 +788,7 @@ export function registerMessageHandler(app: App): void {
     }
 
     if (results.assigned.length + results.queued.length > 0) {
-      await notifySlackFileFailures(client, msg.channel, threadTs, [
-        ...inbound.failed,
-        ...unstoredFiles,
-      ]);
+      await notifySlackFileFailures(client, msg.channel, threadTs, unattached);
     }
 
     // Send consolidated summary as initial tree with Block Kit

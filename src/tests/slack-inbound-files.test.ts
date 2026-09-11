@@ -31,6 +31,7 @@ import {
   fetchSlackFiles,
   notifySlackFileFailures,
 } from "../slack/inbound-files";
+import { instantFlush } from "../slack/thread-buffer";
 
 const TEST_DB_PATH = "./test-slack-inbound-files.sqlite";
 const BOT_TOKEN = "xoxb-inbound-files-test";
@@ -184,11 +185,9 @@ describe("fetchSlackFiles", () => {
   });
 
   test("treats Slack's HTML login page as a failure, not as the file", async () => {
-    const inbound = await fetchSlackFiles(
-      slackClient({ token: "xoxb-wrong" }) as never,
-      [slackFile()],
-      "xoxb-wrong",
-    );
+    const inbound = await fetchSlackFiles(slackClient({ token: "xoxb-wrong" }) as never, [
+      slackFile(),
+    ]);
 
     expect(inbound.fetched).toEqual([]);
     expect(inbound.failed[0]!.reason).toContain("files:read");
@@ -213,6 +212,20 @@ describe("fetchSlackFiles", () => {
     expect(inbound.fetched).toEqual([]);
     expect(inbound.failed[0]!.reason).toContain("download URL");
   });
+
+  test("scrubs secrets out of a download error before it reaches the task or Slack", async () => {
+    const file = slackFile({ url_private_download: "http://127.0.0.1:1/x.png" });
+    const failing = spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+      throw new Error(`upstream rejected ${BOT_TOKEN}`);
+    });
+    try {
+      const inbound = await fetchSlackFiles(slackClient() as never, [file]);
+      expect(inbound.failed[0]!.reason).toContain("download failed");
+      expect(inbound.failed[0]!.reason).not.toContain(BOT_TOKEN);
+    } finally {
+      failing.mockRestore();
+    }
+  });
 });
 
 describe("buildEffectiveText", () => {
@@ -226,6 +239,15 @@ describe("buildEffectiveText", () => {
       "[File: bad.png (image/png, 11 B) id=F0BAD00001] (not attached: HTTP 403)",
     );
   });
+
+  test("still renders a readable line for a file Slack gave only an id for", () => {
+    const bare = { id: "F0BARE0001" } as SlackFile;
+    expect(
+      buildEffectiveText("", [bare], [{ file: bare, reason: "Slack gave no download URL" }]),
+    ).toBe(
+      "[File: F0BARE0001 (unknown type, unknown size) id=F0BARE0001] (not attached: Slack gave no download URL)",
+    );
+  });
 });
 
 describe("createSlackTaskWithFiles", () => {
@@ -233,13 +255,13 @@ describe("createSlackTaskWithFiles", () => {
     const lead = await createAgent({ name: "lead", isLead: true, status: "idle" });
     const inbound = await fetchSlackFiles(slackClient() as never, [slackFile()]);
 
-    const { task, failed } = await createSlackTaskWithFiles(
+    const { task, unattached } = await createSlackTaskWithFiles(
       "please look",
       { agentId: lead.id, source: "slack" },
       inbound,
     );
 
-    expect(failed).toEqual([]);
+    expect(unattached).toEqual([]);
     expect((await getTaskById(task.id))!.status).toBe("pending");
     expect(await wasDraft(task.id)).toBe(true);
 
@@ -284,6 +306,16 @@ describe("createSlackTaskWithFiles", () => {
     expect(new Set(names).size).toBe(2);
   });
 
+  test("reports download failures as unattached even when nothing was stored", async () => {
+    const lead = await createAgent({ name: "lead", isLead: true, status: "idle" });
+    const file = slackFile({ url_private_download: `${slackFiles.url}forbidden/x.png` });
+    const inbound = await fetchSlackFiles(slackClient() as never, [file]);
+
+    const { unattached } = await createSlackTaskWithFiles("x", { agentId: lead.id }, inbound);
+
+    expect(unattached).toEqual(inbound.failed);
+  });
+
   test("still promotes the task when storing an attachment fails", async () => {
     const lead = await createAgent({ name: "lead", isLead: true, status: "idle" });
     const inbound = await fetchSlackFiles(slackClient() as never, [slackFile()]);
@@ -292,11 +324,15 @@ describe("createSlackTaskWithFiles", () => {
     });
 
     try {
-      const { task, failed } = await createSlackTaskWithFiles("x", { agentId: lead.id }, inbound);
+      const { task, unattached } = await createSlackTaskWithFiles(
+        "x",
+        { agentId: lead.id },
+        inbound,
+      );
 
       expect((await getTaskById(task.id))!.status).toBe("pending");
-      expect(failed).toHaveLength(1);
-      expect(failed[0]!.reason).toContain("storage down");
+      expect(unattached).toHaveLength(1);
+      expect(unattached[0]!.reason).toContain("storage down");
     } finally {
       upload.mockRestore();
     }
@@ -449,6 +485,52 @@ describe("Slack ingress with files", () => {
     );
     expect(followUp?.agentId).toBe(lead.id);
     expect(await getTaskAttachments(followUp!.id)).toHaveLength(1);
+  });
+
+  test("a follow-up queued by ADDITIVE_SLACK says its file was not attached", async () => {
+    await createAgent({ name: "lead", isLead: true, status: "busy" });
+    const { task: first } = await sendAssistantDm({ subtype: undefined, text: "start" });
+    await getDbClient().run("UPDATE agent_tasks SET status = 'in_progress' WHERE id = ?", [
+      first!.id,
+    ]);
+    process.env.ADDITIVE_SLACK = "true";
+    const client = slackClient();
+
+    try {
+      seq += 1;
+      await assistantMessage({
+        message: {
+          channel: first!.slackChannelId,
+          thread_ts: first!.slackThreadTs,
+          ts: `1800000000.${String(seq).padStart(6, "0")}`,
+          user: "U_HUMAN",
+          subtype: "file_share",
+          text: "",
+          files: [slackFile()],
+        },
+        body: { event_id: `evt_inbound_files_${seq}` },
+        client,
+        say: mock(async () => ({})),
+        setStatus: mock(async () => {}),
+        setTitle: mock(async () => {}),
+        getThreadContext: mock(async () => ({})),
+      });
+    } finally {
+      process.env.ADDITIVE_SLACK = "false";
+    }
+
+    expect(fileRequests).toEqual([]);
+    expect(client.chat.postMessage).toHaveBeenCalledTimes(1);
+    const [args] = client.chat.postMessage.mock.calls[0] as unknown as [{ text: string }];
+    expect(args.text).toContain("`screenshot.png` (follow-ups queued by ADDITIVE_SLACK");
+
+    // Drain the debounce buffer now, while the DB is still open.
+    await instantFlush(`${first!.slackChannelId}:${first!.slackThreadTs}`);
+    const queued = await getDbClient().get<{ task: string }>(
+      "SELECT task FROM agent_tasks WHERE slackThreadTs = ? AND id != ? ORDER BY createdAt DESC",
+      [first!.slackThreadTs, first!.id],
+    );
+    expect(queued?.task).toContain("(not attached: follow-ups queued by ADDITIVE_SLACK");
   });
 
   test("a channel message that mentions the bot with a file attaches it", async () => {

@@ -1,6 +1,6 @@
 import { asRecord, expect, expectStatus, pollUntil } from "../http";
 import type { Scenario, ScenarioContext } from "../run";
-import { findSlackTask, registerLead } from "./slack-helpers";
+import { claim, findSlackTask, finish, registerLead } from "./slack-helpers";
 
 // A few bytes that are recognisably a PNG; the content is never decoded.
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7, 7]);
@@ -68,17 +68,19 @@ async function expectStoredScreenshot(ctx: ScenarioContext, taskId: string): Pro
 export const slackAssistantFileShare: Scenario = {
   name: "slack-assistant-file-share",
   async run(ctx) {
-    const leadId = await registerLead(ctx, `e2e-lead-files-${ctx.nonce}`);
+    await registerLead(ctx, `e2e-lead-files-${ctx.nonce}`);
 
     const imageOnly = await shareImageInAssistantDm(ctx, "");
     const imageOnlyId = String(imageOnly.id);
+    // Earlier scenarios register leads too; poll as whichever one got the task.
+    const assignee = String(imageOnly.agentId);
     expect(
       String(imageOnly.task).includes("[File: screenshot.png (image/png"),
       `Image-only task text is ${JSON.stringify(imageOnly.task)}`,
     );
     const attachmentId = await expectStoredScreenshot(ctx, imageOnlyId);
 
-    const poll = await ctx.api("GET", "/api/poll", { agentId: leadId });
+    const poll = await ctx.api("GET", "/api/poll", { agentId: assignee });
     expectStatus(poll, [200], "lead polls for the image-only task");
     const trigger = asRecord(asRecord(poll.json).trigger);
     const polledTask = asRecord(trigger.task);
@@ -90,13 +92,21 @@ export const slackAssistantFileShare: Scenario = {
       JSON.stringify(polledTask.attachments).includes(attachmentId),
       `Poll trigger carries attachments ${JSON.stringify(polledTask.attachments)}`,
     );
+    await finish(ctx, assignee, imageOnlyId, { status: "completed", output: "Saw the image." });
 
     const captioned = await shareImageInAssistantDm(ctx, "aaa");
+    const captionedId = String(captioned.id);
     expect(
       String(captioned.task).startsWith("aaa") &&
         String(captioned.task).includes("[File: screenshot.png"),
       `Captioned task text is ${JSON.stringify(captioned.task)}`,
     );
-    await expectStoredScreenshot(ctx, String(captioned.id));
+    await expectStoredScreenshot(ctx, captionedId);
+    // Leave nothing pending for the scenarios that poll after this one.
+    await claim(ctx, String(captioned.agentId), captionedId);
+    await finish(ctx, String(captioned.agentId), captionedId, {
+      status: "completed",
+      output: "Saw the image and the caption.",
+    });
   },
 };

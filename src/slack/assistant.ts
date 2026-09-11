@@ -7,6 +7,7 @@ import { resolveSlackUserId, rewriteSlackMentions } from "./enrich";
 import { wasEventSeen } from "./event-dedup";
 import type { SlackFile } from "./files";
 import {
+  bufferedFileFailures,
   buildEffectiveText,
   createSlackTaskWithFiles,
   fetchSlackFiles,
@@ -130,22 +131,25 @@ export function createAssistant(): Assistant {
         // Follow-up message → route to the same agent. Buffered follow-ups
         // carry the `[File: …]` lines only; their files are not attached.
         if (workingAgent && workingAgent.status !== "offline" && isAdditiveSlack()) {
+          const unattached = bufferedFileFailures(files);
           bufferThreadMessage(
             channelId,
             threadTs,
-            buildEffectiveText(messageText, files),
+            buildEffectiveText(messageText, files, unattached),
             userId,
             message.ts,
           );
           const count = getBufferMessageCount(`${channelId}:${threadTs}`);
           const event = count === 1 ? "accepted" : "buffered";
           await ackSlackMessage(client, channelId, message.ts, reactionName(event), event);
+          await notifySlackFileFailures(client, channelId, threadTs, unattached);
           await safeSetStatus("Queuing follow-up...");
           return;
         }
 
         // Fetch shared files before the task text is final: a file that can't be
         // downloaded is flagged in it.
+        if (files?.length) await safeSetStatus("Downloading attachments...");
         const inbound = await fetchSlackFiles(client, files);
         // Any in-body `<@U…>` mention the requester typed is rewritten via
         // the identity primitive before it reaches agent-visible task text —
@@ -158,7 +162,7 @@ export function createAssistant(): Assistant {
         if (workingAgent && workingAgent.status !== "offline") {
           // Otherwise, create a follow-up task for the working agent
           const latestTask = await getMostRecentTaskInThread(channelId, threadTs);
-          const { task, failed: unstoredFiles } = await createSlackTaskWithFiles(
+          const { task, unattached } = await createSlackTaskWithFiles(
             renderedMessageText,
             {
               agentId: workingAgent.id,
@@ -180,10 +184,7 @@ export function createAssistant(): Assistant {
             reactionName("accepted"),
             "accepted",
           );
-          await notifySlackFileFailures(client, channelId, threadTs, [
-            ...inbound.failed,
-            ...unstoredFiles,
-          ]);
+          await notifySlackFileFailures(client, channelId, threadTs, unattached);
 
           if (isSlackRenderV2Enabled()) await ensureSlackThreadTree([task.id]);
 
@@ -212,7 +213,7 @@ export function createAssistant(): Assistant {
         const lead = await getLeadAgent();
         if (!lead) {
           // No lead — still queue the task
-          const { task, failed: unstoredFiles } = await createSlackTaskWithFiles(
+          const { task, unattached } = await createSlackTaskWithFiles(
             renderedMessageText + channelContext,
             {
               source: "slack",
@@ -232,10 +233,7 @@ export function createAssistant(): Assistant {
             reactionName("accepted"),
             "accepted",
           );
-          await notifySlackFileFailures(client, channelId, threadTs, [
-            ...inbound.failed,
-            ...unstoredFiles,
-          ]);
+          await notifySlackFileFailures(client, channelId, threadTs, unattached);
           if (isSlackRenderV2Enabled()) {
             await ensureSlackThreadTree([task.id]);
           } else {
@@ -245,7 +243,7 @@ export function createAssistant(): Assistant {
           return;
         }
 
-        const { task, failed: unstoredFiles } = await createSlackTaskWithFiles(
+        const { task, unattached } = await createSlackTaskWithFiles(
           renderedMessageText + channelContext,
           {
             agentId: lead.id,
@@ -260,10 +258,7 @@ export function createAssistant(): Assistant {
           inbound,
         );
         await ackSlackMessage(client, channelId, message.ts, reactionName("accepted"), "accepted");
-        await notifySlackFileFailures(client, channelId, threadTs, [
-          ...inbound.failed,
-          ...unstoredFiles,
-        ]);
+        await notifySlackFileFailures(client, channelId, threadTs, unattached);
         if (isSlackRenderV2Enabled()) await ensureSlackThreadTree([task.id]);
         // setStatus shows typing indicator — watcher will post final result when done
       } catch (error) {

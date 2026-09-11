@@ -16,8 +16,6 @@ import { scrubSecrets } from "../utils/secret-scrubber";
 import { route } from "./route-def";
 import { BODY_TOO_LARGE, enforceContentLengthCap, jsonError } from "./utils";
 
-const MAX_UPLOAD_BYTES = MAX_TASK_ATTACHMENT_BYTES;
-
 // Upload wall-clock past which the provider round-trip is worth a log line.
 // Attachment stalls were invisible before: this path had no timing at all.
 const SLOW_UPLOAD_LOG_MS = 3_000;
@@ -300,7 +298,8 @@ export async function handleFs(
   }
 
   if (uploadTaskFileRoute.match(req.method, pathSegments)) {
-    if (enforceContentLengthCap(req, res, MAX_UPLOAD_BYTES) === BODY_TOO_LARGE) return true;
+    if (enforceContentLengthCap(req, res, MAX_TASK_ATTACHMENT_BYTES) === BODY_TOO_LARGE)
+      return true;
     const parsed = await uploadTaskFileRoute.parse(req, res, pathSegments, queryParams);
     if (!parsed) return true;
     const task = await getTaskById(parsed.params.taskId);
@@ -338,9 +337,9 @@ async function sendUpload(
   query: z.infer<typeof uploadQuery>,
   agentId: string | null,
 ): Promise<boolean> {
-  const body = await readRawBody(req, MAX_UPLOAD_BYTES);
+  const body = await readRawBody(req, MAX_TASK_ATTACHMENT_BYTES);
   if (body === BODY_TOO_LARGE) {
-    jsonError(res, `Payload too large (max ${MAX_UPLOAD_BYTES} bytes)`, 413);
+    jsonError(res, `Payload too large (max ${MAX_TASK_ATTACHMENT_BYTES} bytes)`, 413);
     return true;
   }
 

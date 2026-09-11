@@ -6,8 +6,10 @@
  * same fetch recipe as a file uploaded from the UI. The task is created in
  * `draft` while that happens (#1240): nobody can claim it before its
  * attachments exist. Every file also stays in the task text as a
- * `[File: …]` line, and a file that could not be attached is flagged there
- * and in a thread reply — never dropped silently.
+ * `[File: …]` line, and the user gets a thread reply naming any file that
+ * could not be attached — never dropped silently. A download failure is
+ * also flagged on that line; a storage failure happens after the text is
+ * written, so it shows up only in the reply and in the missing attachment.
  */
 import type { WebClient } from "@slack/web-api";
 import { promoteDraftTask } from "../be/db";
@@ -23,6 +25,7 @@ import "./templates";
 
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 const ATTACHMENT_INTENT = "user-upload";
+const BUFFERED_REASON = "follow-ups queued by ADDITIVE_SLACK carry the file name only";
 
 export type SlackFileFailure = { file: SlackFile; reason: string };
 
@@ -33,7 +36,10 @@ export type InboundSlackFiles = {
   failed: SlackFileFailure[];
 };
 
-const NO_INBOUND_FILES: InboundSlackFiles = { files: [], fetched: [], failed: [] };
+/** Error text safe to put in a task or a Slack message. */
+function errorText(error: unknown): string {
+  return scrubSecrets(error instanceof Error ? error.message : String(error));
+}
 
 /**
  * Format a file size in bytes to a human-readable string.
@@ -55,7 +61,9 @@ export function buildAttachmentText(files: SlackFile[], failed: SlackFileFailure
   const reasons = new Map(failed.map((f) => [f.file.id, f.reason]));
   return files
     .map((f) => {
-      const line = `[File: ${f.name} (${f.mimetype}, ${formatFileSize(f.size)}) id=${f.id}]`;
+      // A file only `files.info` could describe may still lack metadata.
+      const size = typeof f.size === "number" ? formatFileSize(f.size) : "unknown size";
+      const line = `[File: ${f.name ?? f.id} (${f.mimetype ?? "unknown type"}, ${size}) id=${f.id}]`;
       const reason = reasons.get(f.id);
       return reason ? `${line} (not attached: ${reason})` : line;
     })
@@ -86,6 +94,15 @@ export function buildEffectiveText(
 }
 
 /**
+ * The files of a follow-up that `ADDITIVE_SLACK` queues instead of turning into
+ * a task right away: the queued text keeps their `[File: …]` lines, but they
+ * are not attached, so they're reported like any other unattached file.
+ */
+export function bufferedFileFailures(files: SlackFile[] | undefined): SlackFileFailure[] {
+  return (files ?? []).map((file) => ({ file, reason: BUFFERED_REASON }));
+}
+
+/**
  * Download every file on a Slack message with the bot token. Never throws: a
  * file that can't be fetched lands in `failed` with a reason the user and the
  * agent can read.
@@ -93,11 +110,11 @@ export function buildEffectiveText(
 export async function fetchSlackFiles(
   client: WebClient,
   files: SlackFile[] | undefined,
-  token: string | undefined = client.token ?? process.env.SLACK_BOT_TOKEN,
 ): Promise<InboundSlackFiles> {
-  if (!files || files.length === 0) return NO_INBOUND_FILES;
-
   const result: InboundSlackFiles = { files: [], fetched: [], failed: [] };
+  if (!files || files.length === 0) return result;
+
+  const token = client.token ?? process.env.SLACK_BOT_TOKEN;
   for (const eventFile of files) {
     // Slack Connect and some file_share events carry only the file id.
     const file = eventFile.url_private_download
@@ -107,7 +124,7 @@ export async function fetchSlackFiles(
 
     const outcome = await downloadSlackFile(file, token);
     if (typeof outcome === "string") {
-      console.warn(scrubSecrets(`[Slack] could not fetch file ${file.id}: ${outcome}`));
+      console.warn(`[Slack] could not fetch file ${file.id}: ${outcome}`);
       result.failed.push({ file, reason: outcome });
     } else {
       result.fetched.push({ file, body: outcome });
@@ -141,7 +158,7 @@ async function downloadSlackFile(
     if (body.byteLength > MAX_TASK_ATTACHMENT_BYTES) return limit;
     return body;
   } catch (error) {
-    return `download failed (${error instanceof Error ? error.message : String(error)})`;
+    return `download failed (${errorText(error)})`;
   }
 }
 
@@ -149,19 +166,22 @@ async function downloadSlackFile(
  * Create a Slack-sourced task and attach the files fetched from its message.
  * With files, the task is created in `draft` and promoted once every upload
  * has settled — success or not — so a worker can't start before its
- * attachments exist. Returns the files that were fetched but couldn't be stored.
+ * attachments exist. `unattached` lists every file of the message that the
+ * task ended up without: the ones that couldn't be downloaded plus the ones
+ * that couldn't be stored.
  */
 export async function createSlackTaskWithFiles(
   description: string,
   options: CreateTaskOptions,
   inbound: InboundSlackFiles,
-): Promise<{ task: AgentTask; failed: SlackFileFailure[] }> {
+): Promise<{ task: AgentTask; unattached: SlackFileFailure[] }> {
   if (inbound.fetched.length === 0) {
-    return { task: await createTaskWithSiblingAwareness(description, options), failed: [] };
+    const task = await createTaskWithSiblingAwareness(description, options);
+    return { task, unattached: inbound.failed };
   }
 
   const task = await createTaskWithSiblingAwareness(description, { ...options, status: "draft" });
-  const failed: SlackFileFailure[] = [];
+  const unattached = [...inbound.failed];
   try {
     const provider = getFileStorageProvider();
     const usedNames = new Set<string>();
@@ -188,15 +208,15 @@ export async function createSlackTaskWithFiles(
           description: `Shared on Slack (file ${file.id})`,
         });
       } catch (error) {
-        const reason = `could not be stored (${error instanceof Error ? error.message : String(error)})`;
-        console.warn(scrubSecrets(`[Slack] file ${file.id} for task ${task.id} ${reason}`));
-        failed.push({ file, reason });
+        const reason = `could not be stored (${errorText(error)})`;
+        console.warn(`[Slack] file ${file.id} for task ${task.id} ${reason}`);
+        unattached.push({ file, reason });
       }
     }
   } finally {
     await promoteDraftTask(task.id);
   }
-  return { task, failed };
+  return { task, unattached };
 }
 
 /**
@@ -228,11 +248,7 @@ export async function notifySlackFileFailures(
     });
   } catch (error) {
     console.warn(
-      scrubSecrets(
-        `[Slack] could not post the attachment-failure notice in ${channel}/${threadTs}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      ),
+      `[Slack] could not post the attachment-failure notice in ${channel}/${threadTs}: ${errorText(error)}`,
     );
   }
 }
