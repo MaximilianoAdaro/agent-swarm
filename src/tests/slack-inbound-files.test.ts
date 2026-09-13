@@ -54,6 +54,11 @@ const previousEnv = {
 };
 
 const HTML_FILE = new TextEncoder().encode("<html><body>quarterly report</body></html>");
+/** Shaped like Slack's real sign-in page: the title and form the guard matches on. */
+const SIGN_IN_HTML = new TextEncoder().encode(
+  "<!DOCTYPE html><html><head><title>Sign in to Slack | Slack</title></head>" +
+    '<body><form id="signin_form" action="https://slack.com/signin"></form></body></html>',
+);
 const HUGE_BYTES = MAX_TASK_ATTACHMENT_BYTES + 16 * 1024 * 1024;
 /** Per Slack file id bytes the fake host serves; PNG_BYTES by default. */
 const bytesById = new Map<string, Uint8Array>();
@@ -68,7 +73,7 @@ function startFakeSlackFileHost() {
       const url = new URL(req.url);
       fileRequests.push(url.pathname);
       const signIn = () =>
-        new Response("<html><body>Sign in to Slack</body></html>", {
+        new Response(SIGN_IN_HTML, {
           headers: { "content-type": "text/html; charset=utf-8" },
         });
       if (url.pathname === "/signin") return signIn();
@@ -229,7 +234,7 @@ describe("fetchSlackFiles", () => {
     expect(inbound.failed[0]!.reason).toContain("files:read");
   });
 
-  test("rejects an HTML sign-in page served in place, by its size", async () => {
+  test("rejects an HTML sign-in page served in place", async () => {
     const file = slackFile({
       id: "F0HTML0002",
       name: "notes.html",
@@ -237,6 +242,31 @@ describe("fetchSlackFiles", () => {
       size: 4096,
       url_private_download: `${slackFiles.url}login-in-place/T0-F0HTML0002/notes.html`,
     });
+    await using inbound = await fetchSlackFiles(slackClient() as never, [file]);
+
+    expect(inbound.fetched).toEqual([]);
+    expect(inbound.failed[0]!.reason).toContain("files:read");
+  });
+
+  // Size alone can't tell the sign-in page from the file: Slack's declared size
+  // can match what the sign-in response happens to be (or just be stale), and
+  // then the login page is stored as the agent's HTML attachment.
+  test("rejects an in-place sign-in page that is exactly the declared size", async () => {
+    const file = slackFile({
+      id: "F0HTML0003",
+      name: "summary.html",
+      mimetype: "text/html",
+      size: SIGN_IN_HTML.byteLength,
+      url_private_download: `${slackFiles.url}login-in-place/T0-F0HTML0003/summary.html`,
+    });
+    await using inbound = await fetchSlackFiles(slackClient() as never, [file]);
+
+    expect(inbound.fetched).toEqual([]);
+    expect(inbound.failed[0]!.reason).toContain("files:read");
+  });
+
+  test("rejects HTML that isn't the declared size, sign-in page or not", async () => {
+    const file = { ...htmlReport(), size: 4096 };
     await using inbound = await fetchSlackFiles(slackClient() as never, [file]);
 
     expect(inbound.fetched).toEqual([]);

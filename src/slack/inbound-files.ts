@@ -34,6 +34,19 @@ import "./templates";
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 const SIGNED_OUT_REASON =
   "Slack returned its sign-in page instead of the file (is the files:read scope granted?)";
+/**
+ * Slack can serve its sign-in page at the file's own URL, as `text/html`, at
+ * whatever length the file's declared size happens to be — so for a file that
+ * really is HTML, neither the MIME type, the redirect, nor the size separates
+ * the page from the file. Only the page itself does.
+ */
+const SIGN_IN_MARKERS = [
+  /<title>[^<]*sign in to slack/i,
+  /id="signin[_-]form"/i,
+  /slack\.com\/(workspace-)?signin/i,
+];
+/** Enough of an HTML body to carry the markers above; a sign-in page leads with them. */
+const SIGN_IN_SNIFF_BYTES = 4096;
 /** How often a draft's lease is renewed while its uploads run; the sweep waits 5 minutes. */
 let draftLeaseRefreshMs = 60_000;
 /** A file a user sent the bot, like one uploaded from the dashboard composer. */
@@ -171,13 +184,26 @@ export async function fetchSlackFiles(
   return result;
 }
 
+/** Does the start of an HTML response read like Slack's sign-in page? */
+function looksLikeSignIn(head: Uint8Array[]): boolean {
+  const joined = new Uint8Array(head.reduce((total, part) => total + part.byteLength, 0));
+  let offset = 0;
+  for (const part of head) {
+    joined.set(part, offset);
+    offset += part.byteLength;
+  }
+  const text = new TextDecoder().decode(joined);
+  return SIGN_IN_MARKERS.some((marker) => marker.test(text));
+}
+
 /**
  * Stream one file to `path`, enforcing the attachment cap as bytes arrive, or
  * return why it couldn't be fetched. Without `files:read` Slack serves its HTML
  * sign-in page instead of the file, via a redirect or in place. So an HTML
  * response counts as "not the file" when the file isn't HTML, when it came
- * through a redirect off `/files-pri/`, or when its size isn't the one Slack
- * declared for the file. Non-HTML responses are never second-guessed.
+ * through a redirect off `/files-pri/`, when the body reads like the sign-in
+ * page, or when its size isn't the one Slack declared for the file. Non-HTML
+ * responses are never second-guessed.
  */
 async function downloadSlackFile(
   file: SlackFile,
@@ -214,12 +240,19 @@ async function downloadSlackFile(
     const sink = Bun.file(path).writer({ highWaterMark: 1024 * 1024 });
     let sizeBytes = 0;
     let overCap = false;
+    const head: Uint8Array[] = [];
+    let headBytes = 0;
     try {
       for await (const chunk of response.body ?? []) {
         sizeBytes += chunk.byteLength;
         if (sizeBytes > MAX_TASK_ATTACHMENT_BYTES) {
           overCap = true;
           break;
+        }
+        if (isHtml && headBytes < SIGN_IN_SNIFF_BYTES) {
+          const wanted = chunk.subarray(0, SIGN_IN_SNIFF_BYTES - headBytes);
+          head.push(wanted);
+          headBytes += wanted.byteLength;
         }
         hasher.update(chunk);
         sink.write(chunk);
@@ -231,6 +264,7 @@ async function downloadSlackFile(
       abort.abort();
       return limit;
     }
+    if (isHtml && looksLikeSignIn(head)) return SIGNED_OUT_REASON;
     if (isHtml && file.size > 0 && sizeBytes !== file.size) {
       return `Slack sent ${sizeBytes} bytes of HTML for a ${file.size}-byte file, likely its sign-in page (is the files:read scope granted?)`;
     }
