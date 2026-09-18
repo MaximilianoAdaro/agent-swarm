@@ -196,7 +196,19 @@ USER worker
 # override, so this RUN floats with upstream.
 # It unpacks into ~/.local/share/cursor-agent/versions/ and symlinks both `agent`
 # and `cursor-agent` into ~/.local/bin, which ENV PATH above already covers.
-RUN curl https://cursor.com/install -fsS | bash
+# The tarball also ships two Single Executable Applications (~264 MB combined)
+# that each embed their own copy of the Node runtime. Nothing in the install
+# tree runs them: the `cursor-agent` launcher execs the loose `node` against
+# index.js, and the one chunk that references them looks under
+# ~/.cursor/cursor-agent-sea/ instead — a separate, lazily downloaded path.
+# The prune MUST stay in this RUN; a later one would leave the bytes in the
+# layer below. `rm` is deliberately not `-f`: this tarball cannot be pinned, so
+# a silent no-op after an upstream repackaging would regress the image size
+# undetected — better to fail the build and re-check the layout.
+RUN curl https://cursor.com/install -fsS | bash \
+    && CURSOR_AGENT_DIR="$(dirname "$(readlink -f /home/worker/.local/bin/cursor-agent)")" \
+    && rm "${CURSOR_AGENT_DIR}/cursor-agent-sea" "${CURSOR_AGENT_DIR}/cursor-agent-worker-sea" \
+    && which cursor-agent && cursor-agent --version
 
 # Install context-mode CLI globally (context-window compression tools for all
 # harnesses). The global install puts `context-mode` on PATH (for Claude/Codex
