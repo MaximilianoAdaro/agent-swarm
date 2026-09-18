@@ -188,6 +188,16 @@ RUN HOME=/root NPM_CONFIG_CACHE=/tmp/npm-cache \
     && rm -rf /tmp/npm-cache /root/.npm
 USER worker
 
+# Install Cursor Agent CLI (alternative harness, selected via HARNESS_PROVIDER=acp
+# with ACP_TARGET=custom and ACP_TARGET_COMMAND=cursor-agent — see .env.example).
+# The installer resolves linux/x64 and linux/arm64 from `uname -m`, so both CI
+# build legs are covered natively. Unlike every other CLI here it cannot be
+# pinned: the served script hardcodes its own version and honours no VERSION
+# override, so this RUN floats with upstream.
+# It unpacks into ~/.local/share/cursor-agent/versions/ and symlinks both `agent`
+# and `cursor-agent` into ~/.local/bin, which ENV PATH above already covers.
+RUN curl https://cursor.com/install -fsS | bash
+
 # Install context-mode CLI globally (context-window compression tools for all
 # harnesses). The global install puts `context-mode` on PATH (for Claude/Codex
 # stdio MCP) AND makes the package importable (for the OpenCode in-process
