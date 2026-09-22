@@ -35,7 +35,7 @@ SDK selection is incompatible with an effective Claude Bridge or legacy bridge b
 | Steering | `STEERING_ENABLED`, `SLACK_THREAD_STEERING`, `SLACK_THREAD_STEERING_MODE` |
 | Memory | `MEMORY_HYBRID_SEARCH`, `MEMORY_GRAPH_EXPANSION`, `MEMORY_RATERS`, `EMBEDDING_MODEL` |
 | Heartbeat & crash recovery | `HEARTBEAT_INTERVAL_MS`, `HEARTBEAT_STALL_THRESHOLD_MIN`, `RUNTIME_STALE_THRESHOLD_MIN`, `HEARTBEAT_PIN_CRASH_RESUME` |
-| Harness & tools | `SCRIPTS_ONLY_MCP`, `TASK_TOOL_PRELOAD_ENABLED`, `TASK_TOOL_MANIFESTS`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `OPENROUTER_BASE_URL`, `WORKER_API_READY_TIMEOUT_SECONDS`, `CONTEXT_PREAMBLE_MAX_TOKENS` |
+| Harness & tools | `SCRIPTS_ONLY_MCP`, `TASK_TOOL_PRELOAD_ENABLED`, `TASK_TOOL_MANIFESTS`, `MCP_MAX_SESSIONS_PER_AGENT`, `MCP_TRANSPORT_IDLE_TIMEOUT_MS`, `MULTI_RUNTIME_ENABLED`, `CAPABILITIES`, `OPENROUTER_BASE_URL`, `WORKER_API_READY_TIMEOUT_SECONDS`, `CONTEXT_PREAMBLE_MAX_TOKENS` |
 | Database | `DB_QUERY_BOUNDED_ENABLED`, `DB_QUERY_HTTP_BUDGET_MS`, `DB_QUERY_HTTP_MAX_ROWS`, `DB_QUERY_MCP_BUDGET_MS`, `DB_QUERY_MCP_MAX_ROWS`, `DB_QUERY_CONCURRENCY_CAP`, `SESSION_LOG_RETENTION_DAYS`, `AGENT_LOG_RETENTION_DAYS`, `EVENTS_RETENTION_DAYS`, `DB_RETENTION_DRY_RUN`, `DB_RETENTION_TICK_BUDGET_MS`, `DB_RETENTION_CATCHUP_INTERVAL_MS`, `DB_RETENTION_MAX_STATEMENT_MS` |
 | Integrations | `SLACK_MODE`, `SLACK_DISABLE`, `SLACK_ALLOW_DEV_SOCKET_MODE`, `SLACK_RENDER_V2`, `SLACK_RENDER_V2_DELEGATION`, `SLACK_CONCLUSION_SETTLE_SEC`, `SLACK_CONCLUSION_TIMEOUT_MIN`, `SLACK_TREE_STALL_MIN`, `GITHUB_DISABLE`, `LINEAR_DISABLE`, `SLACK_ALERTS_CHANNEL`, `AGENT_FS_REQUEST_TIMEOUT_MS`, `SLACK_REACTION_ACCEPTED`, `SLACK_REACTION_BUFFERED`, `SLACK_REACTION_NOW`, `SLACK_REACTION_STEERED`, `SLACK_REACTION_COMPLETED`, `SLACK_REACTION_FAILED` |
 | Security & access | `RBAC_ENABLED`, `BUDGET_ADMISSION_DISABLED`, `MCP_OAUTH_ALLOW_PRIVATE_HOSTS`, `CORS_ALLOWED_ORIGINS` (custom list replaces hosted/dev defaults; unset or blank uses defaults) |
@@ -94,6 +94,24 @@ Every row shows its default, and rows with a stored value offer a **Reset** acti
 
   The API server reads this value into a module-level constant at boot, so a saved value takes effect on the next restart (the **Restart required** badge on this row).
 </Callout>
+
+## MCP session limits
+
+Every MCP session holds a server instance with the full tool registry in memory, and MCP clients
+very rarely close a session when they are done — the server reclaims them instead.
+
+`MCP_MAX_SESSIONS_PER_AGENT` (default `16`) caps how many live sessions one agent may hold. When an
+agent opens one past the cap, its least-recently-used sessions are closed first, so the session it
+is actively using survives and abandoned ones are shed. A normal worker uses a single session; raise
+this only for an agent that legitimately runs several MCP clients in parallel.
+
+`MCP_TRANSPORT_IDLE_TIMEOUT_MS` (default `7200000`, two hours) is how long a session with no traffic
+survives before the periodic sweep closes it. Lower it to reclaim memory sooner; set it too low and
+a worker that is idle mid-task has to re-initialize its session. The value is re-read on each sweep,
+so a change applies on the next tick without a restart.
+
+Together these bound what a misbehaving client can pin: without them, a client that opens a session
+per call and never closes it keeps every one of them resident for the full idle window.
 
 ## Task tool preloading
 

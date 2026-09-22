@@ -312,6 +312,24 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         docsUrl: `${DOCS}ui/configuration`,
       },
       {
+        key: "MCP_MAX_SESSIONS_PER_AGENT",
+        label: "Max MCP sessions per agent",
+        description:
+          "Live MCP sessions one agent may hold. Each session pins a server instance with the whole tool registry in memory. When an agent goes over, its least-recently-used sessions are closed so the active one survives. A normal worker uses one; raise this only if an agent legitimately runs many parallel MCP clients.",
+        kind: "number",
+        defaultValue: "16",
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
+        key: "MCP_TRANSPORT_IDLE_TIMEOUT_MS",
+        label: "MCP session idle timeout (ms)",
+        description:
+          "How long an MCP session with no traffic is kept before the periodic sweep closes it and frees its server instance. Clients rarely close sessions themselves, so this is what reclaims them. Lower it to reclaim memory sooner; too low and a worker idle mid-task has to re-initialize. Default is 2 hours.",
+        kind: "number",
+        defaultValue: "7200000",
+        docsUrl: `${DOCS}ui/configuration`,
+      },
+      {
         key: "SCRIPTS_ONLY_MCP",
         label: "Scripts-only MCP",
         description:

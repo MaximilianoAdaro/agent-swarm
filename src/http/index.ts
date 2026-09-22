@@ -79,10 +79,10 @@ import { handleIntegrations } from "./integrations";
 import { handleKv } from "./kv";
 import {
   closeIdleMcpTransports,
-  DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
   handleMcp,
   type McpSessionAgents,
   type McpTransportActivity,
+  resolveMcpTransportIdleTimeoutMs,
 } from "./mcp";
 import { handleMcpBridge } from "./mcp-bridge";
 import { handleMcpOAuth } from "./mcp-oauth";
@@ -161,7 +161,6 @@ const globalState = globalThis as typeof globalThis & {
 };
 
 const API_GC_INTERVAL_MS = 5 * 60 * 1000;
-const MCP_TRANSPORT_IDLE_TIMEOUT_MS = DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS;
 const serverStartedAt = Date.now();
 let shutdownSignal = "unknown";
 
@@ -196,8 +195,11 @@ function startApiGcInterval() {
     void sweepRooms().catch((error) =>
       console.error("[rooms] Sweep failed:", scrubSecrets(String(error))),
     );
+    // Resolved per sweep so a MCP_TRANSPORT_IDLE_TIMEOUT_MS change saved in the
+    // dashboard takes effect on the next tick instead of needing a restart.
+    const idleTimeoutMs = resolveMcpTransportIdleTimeoutMs();
     const closedOwnerTransports = closeIdleMcpTransports(transports, transportActivity, {
-      idleTimeoutMs: MCP_TRANSPORT_IDLE_TIMEOUT_MS,
+      idleTimeoutMs,
       label: "MCP",
       onClose: (id) => {
         delete mcpSessionAgents[id];
@@ -207,7 +209,7 @@ function startApiGcInterval() {
       transportsUser,
       sessionUsers,
       transportActivityUser,
-      { idleTimeoutMs: MCP_TRANSPORT_IDLE_TIMEOUT_MS },
+      { idleTimeoutMs },
     );
     if (closedOwnerTransports > 0 || closedUserTransports > 0) {
       console.log(
