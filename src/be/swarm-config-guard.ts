@@ -74,7 +74,8 @@ export const DB_RETENTION_TUNING_BOUNDS = {
  * exactly these bounds (falling back to its default outside them) and
  * VALIDATED_KEYS below rejects out-of-range writes, so the dashboard cannot
  * save a value the runtime silently ignores. The idle-timeout floor is a
- * minute: anything shorter reaps sessions a worker is still between calls on.
+ * minute: anything shorter reaps sessions a worker is only pausing between
+ * calls on. (A session mid-call is never reaped, whatever the timeout.)
  */
 export const MCP_SESSION_BOUNDS = {
   MCP_MAX_SESSIONS_PER_AGENT: { min: 1, max: 1_000 },

@@ -115,7 +115,8 @@ legitimately runs several MCP clients in parallel. Accepted values are whole num
 `1000`.
 
 `MCP_TRANSPORT_IDLE_TIMEOUT_MS` (default `7200000`, two hours) is how long a session with no traffic
-survives before the periodic sweep closes it. Lower it to reclaim memory sooner; set it too low and
+survives before the periodic sweep closes it. A session with a request still being answered is never
+closed by the sweep, however long the call runs. Lower it to reclaim memory sooner; set it too low and
 a worker that is idle mid-task has to re-initialize its session. Accepted values are whole numbers
 from `60000` (one minute) to `604800000` (seven days). The value is re-read on each sweep, so a change
 applies on the next tick without a restart.

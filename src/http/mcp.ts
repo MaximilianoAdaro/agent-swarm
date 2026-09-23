@@ -309,7 +309,12 @@ export function closeIdleMcpTransports(
   const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS;
   let closed = 0;
 
+  const busy = busySessionsFor(transports);
   for (const [id, transport] of Object.entries(transports)) {
+    // A call can outlast the idle timeout (a `script-run` may take minutes and
+    // its activity was stamped when it began); reaping it would cut the stream
+    // its result is due on. It gets a fresh stamp when the response settles.
+    if (busy.has(id)) continue;
     const lastActivity = sessionActivity[id];
     if (lastActivity === undefined) {
       sessionActivity[id] = now;

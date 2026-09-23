@@ -16,11 +16,15 @@ let releaseGate: () => void = () => {};
 let gate = new Promise<void>((resolve) => {
   releaseGate = resolve;
 });
+// Each call to the tool reports in here before it blocks, so a test can wait
+// until the server is really holding the request instead of sleeping.
+let onToolStarted: () => void = () => {};
 
 mock.module("../server", () => ({
   createServer: async () => {
     const server = new McpServer({ name: "busy-test", version: "1" });
     server.registerTool("block", { description: "Waits for the test gate" }, async () => {
+      onToolStarted();
       await gate;
       return { content: [{ type: "text" as const, text: "done" }] };
     });
@@ -75,24 +79,27 @@ async function connect(agentId: string): Promise<{ client: Client; sessionId: st
   return { client, sessionId: added[0] as string };
 }
 
-/** Let the server receive the call and start the tool before the test moves on. */
-async function settle(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 50));
-}
-
-function resetGate(): void {
+/** Close the gate and return a promise that resolves once `count` calls are blocked on it. */
+function resetGate(count: number): Promise<void> {
   gate = new Promise<void>((resolve) => {
     releaseGate = resolve;
+  });
+  let started = 0;
+  return new Promise<void>((resolve) => {
+    onToolStarted = () => {
+      started++;
+      if (started === count) resolve();
+    };
   });
 }
 
 test("a session waiting on a tool call survives eviction and still gets its result", async () => {
-  resetGate();
+  const blocked = resetGate(1);
   const agentId = (await createAgent({ name: "busy-agent-a", isLead: false, status: "idle" })).id;
 
   const busy = await connect(agentId);
   const pendingCall = busy.client.callTool({ name: "block", arguments: {} });
-  await settle();
+  await blocked;
 
   // Opened after the call started, so `busy` is this agent's least recently
   // used session: plain LRU would evict it first.
@@ -109,7 +116,7 @@ test("a session waiting on a tool call survives eviction and still gets its resu
 });
 
 test("initialize is refused with 429 when every session over the cap is mid-call", async () => {
-  resetGate();
+  const blocked = resetGate(2);
   const agentId = (await createAgent({ name: "busy-agent-b", isLead: false, status: "idle" })).id;
 
   const first = await connect(agentId);
@@ -117,7 +124,7 @@ test("initialize is refused with 429 when every session over the cap is mid-call
   const calls = [first, second].map(({ client }) =>
     client.callTool({ name: "block", arguments: {} }),
   );
-  await settle();
+  await blocked;
 
   const res = await fetch(url, {
     method: "POST",

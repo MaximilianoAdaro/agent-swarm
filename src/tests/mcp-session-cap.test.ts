@@ -5,6 +5,7 @@ import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/se
 import { MCP_SESSION_BOUNDS, validateConfigValue } from "../be/swarm-config-guard";
 import type { McpSessionAgents, McpTransportActivity } from "../http/mcp";
 import {
+  closeIdleMcpTransports,
   countMcpSessionsForAgent,
   DEFAULT_MCP_MAX_SESSIONS_PER_AGENT,
   DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
@@ -196,6 +197,27 @@ describe("MCP cap never evicts a session mid-request", () => {
     expect(reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 })).toBeNull();
     expect(closed).toEqual([]);
     expect(countMcpSessionsForAgent(transports, agents, "agent_a").pending).toBe(0);
+  });
+
+  test("the idle sweep skips a session mid-call, however long it has run", () => {
+    const closed: string[] = [];
+    const transports: Record<string, StreamableHTTPServerTransport> = {
+      busy: fakeTransport(() => closed.push("busy")),
+      idle: fakeTransport(() => closed.push("idle")),
+    };
+    // Both stamped long past the timeout; only one has a response still open.
+    const activity: McpTransportActivity = { busy: 1_000, idle: 1_000 };
+    const res = fakeResponse();
+    trackMcpSessionRequest(transports, activity, "busy", res);
+
+    const now = 1_000 + 10 * 60_000;
+    expect(closeIdleMcpTransports(transports, activity, { now, idleTimeoutMs: 60_000 })).toBe(1);
+    expect(closed).toEqual(["idle"]);
+    expect(transports.busy).toBeDefined();
+
+    // Once the call finishes it is stamped fresh, not reaped on the next tick.
+    res.emit("finish");
+    expect(activity.busy).toBeGreaterThan(1_000);
   });
 
   test("a session is evictable again once its response settles, counted once", () => {
