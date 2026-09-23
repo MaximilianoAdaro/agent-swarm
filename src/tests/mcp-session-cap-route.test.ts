@@ -5,7 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { closeDb, createAgent, initDb } from "../be/db";
-import { handleMcp } from "../http/mcp";
+import { countMcpSessionsForAgent, handleMcp, reserveMcpSessionSlot } from "../http/mcp";
 import { listenOnFreePort } from "./test-net";
 
 // Covers the wiring the unit tests in mcp-session-cap.test.ts cannot see: that
@@ -61,6 +61,21 @@ async function connect(agentId: string): Promise<string> {
   return added[0] as string;
 }
 
+/** Connect without asserting the session survived: eviction mid-burst is expected. */
+async function connectRaw(agentId: string): Promise<void> {
+  const client = new Client({ name: "cap-test", version: "1" });
+  clients.push(client);
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(url, {
+        requestInit: { headers: { "X-Agent-ID": agentId } },
+      }),
+    );
+  } catch {
+    // A racing initialize may have had its transport closed by the cap.
+  }
+}
+
 const sessionsOf = (agentId: string) =>
   Object.keys(transports).filter((id) => agents[id] === agentId);
 
@@ -86,4 +101,59 @@ test("a session past the cap evicts that agent's oldest and spares other agents"
 
   // And the session that just initialized is never the one evicted.
   expect(transports[third]).toBeDefined();
+});
+
+test("a burst of initializes leaves no reservation behind", async () => {
+  const agentC = (await createAgent({ name: "cap-agent-c", isLead: false, status: "idle" })).id;
+
+  await Promise.all(Array.from({ length: 8 }, () => connectRaw(agentC)));
+
+  const settled = countMcpSessionsForAgent(transports, agents, agentC);
+  // Every request released its slot, whether it succeeded or was evicted.
+  expect(settled.pending).toBe(0);
+  expect(settled.live).toBeLessThanOrEqual(Number(process.env.MCP_MAX_SESSIONS_PER_AGENT));
+});
+
+test("initialize is refused with 429 once live plus in-flight fills the cap", async () => {
+  // Admission happens several awaits before onsessioninitialized registers the
+  // session, so the cap has to count in-flight admissions too. Holding real
+  // reservations on the handler's own registry reproduces that state without
+  // depending on request interleaving, which this runtime does not exhibit.
+  const agentD = (await createAgent({ name: "cap-agent-d", isLead: false, status: "idle" })).id;
+  const cap = Number(process.env.MCP_MAX_SESSIONS_PER_AGENT);
+  const held = Array.from(
+    { length: cap },
+    () => reserveMcpSessionSlot(transports, activity, agents, agentD) as () => void,
+  );
+  expect(held.every(Boolean)).toBe(true);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "X-Agent-ID": agentD,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "cap-test", version: "1" },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(429);
+    expect((await res.json()).error.message).toContain(`limit ${cap}`);
+    // The refusal must not itself consume a slot.
+    expect(countMcpSessionsForAgent(transports, agents, agentD).pending).toBe(cap);
+  } finally {
+    for (const release of held) release();
+  }
+
+  expect(countMcpSessionsForAgent(transports, agents, agentD).pending).toBe(0);
 });

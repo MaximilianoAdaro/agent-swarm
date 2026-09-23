@@ -100,9 +100,15 @@ Every row shows its default, and rows with a stored value offer a **Reset** acti
 Every MCP session holds a server instance with the full tool registry in memory, and MCP clients
 very rarely close a session when they are done — the server reclaims them instead.
 
-`MCP_MAX_SESSIONS_PER_AGENT` (default `16`) caps how many live sessions one agent may hold. When an
-agent opens one past the cap, its least-recently-used sessions are closed first, so the session it
-is actively using survives and abandoned ones are shed. A normal worker uses a single session; raise
+`MCP_MAX_SESSIONS_PER_AGENT` (default `16`) caps how many sessions one agent may hold, counting both
+live sessions and `initialize` requests still in flight. A session is only registered once its
+handshake completes, several awaits after it is admitted, so in-flight admissions have to count too —
+otherwise a burst of concurrent initializes could each observe a stale count and all proceed.
+
+When an agent goes over, its least-recently-used **live** sessions are closed first, so the session it
+is actively using survives and abandoned ones are shed. If in-flight admissions alone fill the cap
+there is nothing left to shed, and the new `initialize` is refused with **HTTP 429** and a JSON-RPC
+error telling the client to close a session and retry. A normal worker uses a single session; raise
 this only for an agent that legitimately runs several MCP clients in parallel.
 
 `MCP_TRANSPORT_IDLE_TIMEOUT_MS` (default `7200000`, two hours) is how long a session with no traffic

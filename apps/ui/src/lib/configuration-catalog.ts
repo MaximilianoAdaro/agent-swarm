@@ -315,7 +315,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "MCP_MAX_SESSIONS_PER_AGENT",
         label: "Max MCP sessions per agent",
         description:
-          "Live MCP sessions one agent may hold. Each session pins a server instance with the whole tool registry in memory. When an agent goes over, its least-recently-used sessions are closed so the active one survives. A normal worker uses one; raise this only if an agent legitimately runs many parallel MCP clients.",
+          "MCP sessions one agent may hold, counting live sessions plus initializes still in flight. Each session pins a server instance with the whole tool registry in memory. Going over closes the least-recently-used live sessions so the active one survives; if in-flight admissions alone fill the cap, the new initialize is refused with HTTP 429. A normal worker uses one; raise this only if an agent legitimately runs many parallel MCP clients.",
         kind: "number",
         defaultValue: "16",
         docsUrl: `${DOCS}ui/configuration`,

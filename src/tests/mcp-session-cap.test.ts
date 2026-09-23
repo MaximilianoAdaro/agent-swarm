@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { McpSessionAgents, McpTransportActivity } from "../http/mcp";
 import {
+  countMcpSessionsForAgent,
   DEFAULT_MCP_MAX_SESSIONS_PER_AGENT,
   DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
   enforceMcpSessionCapForAgent,
+  reserveMcpSessionSlot,
   resolveMcpMaxSessionsPerAgent,
   resolveMcpTransportIdleTimeoutMs,
 } from "../http/mcp";
@@ -111,5 +114,81 @@ describe("MCP session limit env parsing", () => {
     expect(resolveMcpMaxSessionsPerAgent("4")).toBe(4);
     expect(resolveMcpMaxSessionsPerAgent("4.9")).toBe(4);
     expect(resolveMcpTransportIdleTimeoutMs("900000")).toBe(900_000);
+  });
+});
+
+describe("MCP admission accounts for in-flight sessions", () => {
+  // A session only reaches `transports` once onsessioninitialized fires, several
+  // awaits after admission. Counting live sessions alone would let concurrent
+  // initializes each observe a stale count and all proceed.
+  test("live + pending never exceeds the cap, with or without evictable sessions", () => {
+    const transports: Record<string, StreamableHTTPServerTransport> = {};
+    const activity: McpTransportActivity = {};
+    const agents: McpSessionAgents = {};
+    const total = () => countMcpSessionsForAgent(transports, agents, "agent_a").total;
+
+    const first = reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 });
+    expect(first).not.toBeNull();
+    expect(total()).toBe(1);
+
+    const second = reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 });
+    expect(second).not.toBeNull();
+    expect(total()).toBe(2);
+
+    // Nothing is live, so there is nothing to evict: the third must be refused
+    // rather than admitted past the cap.
+    expect(reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 })).toBeNull();
+    expect(total()).toBe(2);
+
+    // Releasing one frees exactly one slot.
+    first?.();
+    expect(total()).toBe(1);
+    const third = reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 });
+    expect(third).not.toBeNull();
+    expect(total()).toBe(2);
+  });
+
+  test("a live session is evicted before an in-flight admission is refused", () => {
+    const closed: string[] = [];
+    const transports: Record<string, StreamableHTTPServerTransport> = {
+      live: fakeTransport(() => closed.push("live")),
+    };
+    const activity: McpTransportActivity = { live: 1_000 };
+    const agents: McpSessionAgents = { live: "agent_a" };
+
+    const held = reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 });
+    expect(held).not.toBeNull();
+    // cap 2 = 1 live + 1 pending, still room for nothing more without eviction.
+    const next = reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 });
+    expect(next).not.toBeNull();
+    expect(closed).toEqual(["live"]);
+    expect(countMcpSessionsForAgent(transports, agents, "agent_a")).toEqual({
+      live: 0,
+      pending: 2,
+      total: 2,
+    });
+  });
+
+  test("release is idempotent and scoped to its own agent", () => {
+    const transports: Record<string, StreamableHTTPServerTransport> = {};
+    const activity: McpTransportActivity = {};
+    const agents: McpSessionAgents = {};
+
+    const release = reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 });
+    reserveMcpSessionSlot(transports, activity, agents, "agent_b", { cap: 2 });
+    release?.();
+    release?.();
+
+    expect(countMcpSessionsForAgent(transports, agents, "agent_a").total).toBe(0);
+    expect(countMcpSessionsForAgent(transports, agents, "agent_b").total).toBe(1);
+  });
+
+  test("pending counters are scoped to their session registry", () => {
+    const registryA: Record<string, StreamableHTTPServerTransport> = {};
+    const registryB: Record<string, StreamableHTTPServerTransport> = {};
+    reserveMcpSessionSlot(registryA, {}, {}, "agent_a", { cap: 2 });
+
+    expect(countMcpSessionsForAgent(registryA, {}, "agent_a").pending).toBe(1);
+    expect(countMcpSessionsForAgent(registryB, {}, "agent_a").pending).toBe(0);
   });
 });
