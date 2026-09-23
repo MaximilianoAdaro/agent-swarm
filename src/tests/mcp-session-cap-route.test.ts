@@ -157,3 +157,46 @@ test("initialize is refused with 429 once live plus in-flight fills the cap", as
 
   expect(countMcpSessionsForAgent(transports, agents, agentD).pending).toBe(0);
 });
+
+test("an initialize hands its reservation to the live entry without double counting", async () => {
+  // `onsessioninitialized` registers the session several steps before the
+  // request's `finally` runs. Observe the registry at the instant of
+  // registration: the agent's reservation must already be gone, or a
+  // concurrent initialize would see this session as both live and pending.
+  const proxied = new Proxy<Record<string, StreamableHTTPServerTransport>>(
+    {},
+    {
+      set(target, id, value, receiver) {
+        const ok = Reflect.set(target, id, value, receiver);
+        seenAtRegistration.push(countMcpSessionsForAgent(receiver, proxiedAgents, agentE));
+        return ok;
+      },
+    },
+  );
+  const proxiedAgents: Record<string, string> = {};
+  const seenAtRegistration: ReturnType<typeof countMcpSessionsForAgent>[] = [];
+  const proxiedServer = createHttpServer(async (req, res) => {
+    if (await handleMcp(req, res, proxied, {}, proxiedAgents)) return;
+    res.writeHead(404).end();
+  });
+  const agentE = (await createAgent({ name: "cap-agent-e", isLead: false, status: "idle" })).id;
+  const proxiedUrl = new URL(
+    `http://127.0.0.1:${await listenOnFreePort(proxiedServer, "127.0.0.1")}/mcp`,
+  );
+  const client = new Client({ name: "cap-test", version: "1" });
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(proxiedUrl, {
+        requestInit: { headers: { "X-Agent-ID": agentE } },
+      }),
+    );
+    expect(seenAtRegistration).toHaveLength(1);
+    // `sessionAgents` is written right after `transports`, so live reads 0 here;
+    // what matters is that the reservation was already released.
+    expect(seenAtRegistration[0]?.pending).toBe(0);
+  } finally {
+    await client.close().catch(() => {});
+    await Promise.all(Object.values(proxied).map((t) => t.close().catch(() => {})));
+    await new Promise<void>((resolve) => proxiedServer.close(() => resolve()));
+  }
+});

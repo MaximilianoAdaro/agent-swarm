@@ -69,6 +69,18 @@ export const DB_RETENTION_TUNING_BOUNDS = {
   DB_RETENTION_MAX_STATEMENT_MS: { min: 25, max: 5_000 },
 } as const;
 
+/**
+ * Ranges for the MCP session knobs. src/http/mcp.ts resolves the env against
+ * exactly these bounds (falling back to its default outside them) and
+ * VALIDATED_KEYS below rejects out-of-range writes, so the dashboard cannot
+ * save a value the runtime silently ignores. The idle-timeout floor is a
+ * minute: anything shorter reaps sessions a worker is still between calls on.
+ */
+export const MCP_SESSION_BOUNDS = {
+  MCP_MAX_SESSIONS_PER_AGENT: { min: 1, max: 1_000 },
+  MCP_TRANSPORT_IDLE_TIMEOUT_MS: { min: 60_000, max: 7 * 24 * 60 * 60 * 1000 },
+} as const;
+
 /** Build `{ KEY: validator }` entries accepting only boolean literals. */
 function booleanValidators(keys: string[]): Record<string, ConfigValidator> {
   const message = (key: string) =>
@@ -337,6 +349,7 @@ const VALIDATED_KEYS: Record<string, ConfigValidator> = {
   // an operator could save a 500ms tick budget, see it accepted, and have the
   // sweep keep running for the default 30000ms.
   ...boundedIntegerValidatorsFor(DB_RETENTION_TUNING_BOUNDS),
+  ...boundedIntegerValidatorsFor(MCP_SESSION_BOUNDS),
   ...boundedIntegerValidators(
     ["SESSION_LOG_RETENTION_DAYS", "AGENT_LOG_RETENTION_DAYS", "EVENTS_RETENTION_DAYS"],
     1,

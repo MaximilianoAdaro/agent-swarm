@@ -289,7 +289,7 @@ export function isScriptsOnlyMcp(): boolean {
 }
 
 /**
- * One-shot latch for the boot-scale seeding inside `createServer()`. `initDb()`
+ * One-shot latches for the boot-scale seeding inside `createServer()`. `initDb()`
  * already self-guards and `startPricingRefreshLoop()` /
  * `registerGithubTaskReactions()` use the same pattern; the pricing and RBAC
  * seeds were the two that still re-ran on every MCP session.
@@ -301,9 +301,18 @@ export function isScriptsOnlyMcp(): boolean {
  *
  * Keyed to the process, not to the DB handle: a test that swaps the DB
  * in-process (`globalThis.__testMigrationTemplate`) and calls `createServer()`
- * again would get an unseeded DB. Reset the latch if you ever need that.
+ * again would get an unseeded DB. Reset the latches if you ever need that.
  */
-let bootSeedsApplied = false;
+let pricingSeedApplied = false;
+/**
+ * Separate from the pricing latch and set only after a sync that SUCCEEDED.
+ * With RBAC off a failed sync is logged and swallowed; latching it anyway would
+ * make every later `createServer()` skip the sync, so flipping the live-reloadable
+ * `RBAC_ENABLED` on afterwards would hand out servers over a broken role catalog
+ * instead of failing closed. The cost: RBAC off plus a broken catalog retries the
+ * sync on every session, which is what every session did before the latch.
+ */
+let rbacSeedsSynced = false;
 
 export async function createServer(
   opts: { scriptsOnly?: boolean; fullSurface?: boolean; preloadedTools?: readonly string[] } = {},
@@ -333,18 +342,19 @@ export async function createServer(
   // startPricingRefreshLoop() owns live price updates from here on.
   // See src/be/seed-pricing.ts for the projection logic and the manual-override
   // constants for runtime-fee / ACU pricing.
-  if (!bootSeedsApplied) {
+  if (!pricingSeedApplied) {
     seedPricingFromModelsDev();
+    pricingSeedApplied = true;
   }
   startPricingRefreshLoop();
 
   // Same reasoning: boot-scale, idempotent, and re-run per MCP session before.
-  // Fail-closed is preserved: when RBAC is on and this throws, the throw escapes
-  // createServer() before the latch is set, so the next call retries the sync and
-  // fails again rather than handing out a server over a broken role catalog.
-  if (!bootSeedsApplied) {
+  // Fail-closed is preserved: the latch is set only on success, so a failed sync
+  // is retried by the next call whether or not RBAC was on when it failed.
+  if (!rbacSeedsSynced) {
     try {
       ensureRbacSeedsSynced();
+      rbacSeedsSynced = true;
     } catch (err) {
       console.error("[startup] Failed to sync RBAC seed rows:", err);
       // RBAC flag-on must fail closed; flag-off deployments should not be bricked
@@ -352,7 +362,6 @@ export async function createServer(
       if (isRbacEnabled()) throw err;
     }
   }
-  bootSeedsApplied = true;
 
   // Subscribe API-side integrations to task-lifecycle events. Idempotent.
   // (Inverts the old be/db → github/task-reactions import; see cycle-break #4.)

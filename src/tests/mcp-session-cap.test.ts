@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import type { ServerResponse } from "node:http";
 import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { MCP_SESSION_BOUNDS, validateConfigValue } from "../be/swarm-config-guard";
 import type { McpSessionAgents, McpTransportActivity } from "../http/mcp";
 import {
   countMcpSessionsForAgent,
@@ -9,6 +12,7 @@ import {
   reserveMcpSessionSlot,
   resolveMcpMaxSessionsPerAgent,
   resolveMcpTransportIdleTimeoutMs,
+  trackMcpSessionRequest,
 } from "../http/mcp";
 
 function fakeTransport(onClose: () => void): StreamableHTTPServerTransport {
@@ -104,16 +108,126 @@ describe("MCP per-agent session cap", () => {
 
 describe("MCP session limit env parsing", () => {
   test("falls back to the defaults on missing or invalid values", () => {
-    for (const raw of [undefined, "", "0", "-5", "abc"]) {
+    for (const raw of [undefined, "", "0", "-5", "abc", "1e3", " "]) {
       expect(resolveMcpMaxSessionsPerAgent(raw)).toBe(DEFAULT_MCP_MAX_SESSIONS_PER_AGENT);
       expect(resolveMcpTransportIdleTimeoutMs(raw)).toBe(DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS);
     }
   });
 
-  test("accepts positive values and floors fractions", () => {
+  // Flooring these used to yield 0: a cap that refuses every initialize and an
+  // idle timeout that reaps every session on the next sweep.
+  test("fractions fall back to the default instead of flooring to zero", () => {
+    for (const raw of ["0.5", "0.999", "0.1", "4.9", "1.0"]) {
+      expect(resolveMcpMaxSessionsPerAgent(raw)).toBe(DEFAULT_MCP_MAX_SESSIONS_PER_AGENT);
+      expect(resolveMcpTransportIdleTimeoutMs(raw)).toBe(DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS);
+    }
+  });
+
+  test("accepts whole numbers inside the bounds and nothing outside them", () => {
+    const cap = MCP_SESSION_BOUNDS.MCP_MAX_SESSIONS_PER_AGENT;
+    const idle = MCP_SESSION_BOUNDS.MCP_TRANSPORT_IDLE_TIMEOUT_MS;
     expect(resolveMcpMaxSessionsPerAgent("4")).toBe(4);
-    expect(resolveMcpMaxSessionsPerAgent("4.9")).toBe(4);
+    expect(resolveMcpMaxSessionsPerAgent(String(cap.min))).toBe(cap.min);
+    expect(resolveMcpMaxSessionsPerAgent(String(cap.max))).toBe(cap.max);
+    expect(resolveMcpMaxSessionsPerAgent(String(cap.max + 1))).toBe(
+      DEFAULT_MCP_MAX_SESSIONS_PER_AGENT,
+    );
     expect(resolveMcpTransportIdleTimeoutMs("900000")).toBe(900_000);
+    expect(resolveMcpTransportIdleTimeoutMs(String(idle.min))).toBe(idle.min);
+    expect(resolveMcpTransportIdleTimeoutMs(String(idle.min - 1))).toBe(
+      DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
+    );
+    expect(resolveMcpTransportIdleTimeoutMs(String(idle.max + 1))).toBe(
+      DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
+    );
+  });
+
+  // The dashboard must not save a value the runtime would quietly replace.
+  test("the config API rejects exactly what the resolvers ignore", () => {
+    for (const [key, { min, max }] of Object.entries(MCP_SESSION_BOUNDS)) {
+      for (const bad of ["0", "-1", "0.5", "abc", String(min - 1), String(max + 1)]) {
+        expect(validateConfigValue(key, bad)).not.toBeNull();
+      }
+      for (const good of [String(min), String(max)]) {
+        expect(validateConfigValue(key, good)).toBeNull();
+      }
+    }
+  });
+});
+
+/** A stand-in response: only the `finish` / `close` events matter here. */
+function fakeResponse(): ServerResponse & EventEmitter {
+  return new EventEmitter() as ServerResponse & EventEmitter;
+}
+
+describe("MCP cap never evicts a session mid-request", () => {
+  test("skips a busy least-recently-used session and evicts the next idle one", () => {
+    const closed: string[] = [];
+    const transports: Record<string, StreamableHTTPServerTransport> = {
+      busy: fakeTransport(() => closed.push("busy")),
+      idle: fakeTransport(() => closed.push("idle")),
+      newest: fakeTransport(() => closed.push("newest")),
+    };
+    const activity: McpTransportActivity = { busy: 1_000, idle: 2_000, newest: 3_000 };
+    const agents: McpSessionAgents = { busy: "agent_a", idle: "agent_a", newest: "agent_a" };
+    const res = fakeResponse();
+    trackMcpSessionRequest(transports, activity, "busy", res);
+
+    const removed = enforceMcpSessionCapForAgent(transports, activity, agents, "agent_a", {
+      cap: 3,
+    });
+
+    expect(removed).toBe(1);
+    expect(closed).toEqual(["idle"]);
+    expect(transports.busy).toBeDefined();
+  });
+
+  test("refuses the new session when only busy sessions stand over the cap", () => {
+    const closed: string[] = [];
+    const transports: Record<string, StreamableHTTPServerTransport> = {
+      s1: fakeTransport(() => closed.push("s1")),
+      s2: fakeTransport(() => closed.push("s2")),
+    };
+    const activity: McpTransportActivity = { s1: 1_000, s2: 2_000 };
+    const agents: McpSessionAgents = { s1: "agent_a", s2: "agent_a" };
+    trackMcpSessionRequest(transports, activity, "s1", fakeResponse());
+    trackMcpSessionRequest(transports, activity, "s2", fakeResponse());
+
+    expect(reserveMcpSessionSlot(transports, activity, agents, "agent_a", { cap: 2 })).toBeNull();
+    expect(closed).toEqual([]);
+    expect(countMcpSessionsForAgent(transports, agents, "agent_a").pending).toBe(0);
+  });
+
+  test("a session is evictable again once its response settles, counted once", () => {
+    const closed: string[] = [];
+    const transports: Record<string, StreamableHTTPServerTransport> = {
+      s1: fakeTransport(() => closed.push("s1")),
+      s2: fakeTransport(() => closed.push("s2")),
+    };
+    const activity: McpTransportActivity = { s1: 1_000, s2: 2_000 };
+    const agents: McpSessionAgents = { s1: "agent_a", s2: "agent_a" };
+    const first = fakeResponse();
+    const second = fakeResponse();
+    trackMcpSessionRequest(transports, activity, "s1", first);
+    trackMcpSessionRequest(transports, activity, "s1", second);
+
+    // `finish` then `close` on one response must release one hold, not two.
+    first.emit("finish");
+    first.emit("close");
+    expect(enforceMcpSessionCapForAgent(transports, activity, agents, "agent_a", { cap: 1 })).toBe(
+      1,
+    );
+    expect(closed).toEqual(["s2"]);
+
+    second.emit("close");
+    // Settling stamps activity, so the finished session is no longer "oldest".
+    expect(activity.s1).toBeGreaterThan(2_000);
+    transports.s3 = fakeTransport(() => closed.push("s3"));
+    agents.s3 = "agent_a";
+    activity.s3 = 1;
+    expect(enforceMcpSessionCapForAgent(transports, activity, agents, "agent_a", { cap: 1 })).toBe(
+      2,
+    );
   });
 });
 

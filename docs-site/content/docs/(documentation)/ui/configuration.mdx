@@ -105,19 +105,29 @@ live sessions and `initialize` requests still in flight. A session is only regis
 handshake completes, several awaits after it is admitted, so in-flight admissions have to count too —
 otherwise a burst of concurrent initializes could each observe a stale count and all proceed.
 
-When an agent goes over, its least-recently-used **live** sessions are closed first, so the session it
-is actively using survives and abandoned ones are shed. If in-flight admissions alone fill the cap
-there is nothing left to shed, and the new `initialize` is refused with **HTTP 429** and a JSON-RPC
-error telling the client to close a session and retry. A normal worker uses a single session; raise
-this only for an agent that legitimately runs several MCP clients in parallel.
+When an agent goes over, its least-recently-used **idle** sessions are closed first, so the session it
+is actively using survives and abandoned ones are shed. A session with a request still being answered
+(a long `script-run`, say) is never closed by the cap, because that would cut the stream its result
+arrives on. If in-flight admissions and busy sessions alone fill the cap there is nothing left to shed,
+and the new `initialize` is refused with **HTTP 429** and a JSON-RPC error telling the client to close
+a session and retry. A normal worker uses a single session; raise this only for an agent that
+legitimately runs several MCP clients in parallel. Accepted values are whole numbers from `1` to
+`1000`.
 
 `MCP_TRANSPORT_IDLE_TIMEOUT_MS` (default `7200000`, two hours) is how long a session with no traffic
 survives before the periodic sweep closes it. Lower it to reclaim memory sooner; set it too low and
-a worker that is idle mid-task has to re-initialize its session. The value is re-read on each sweep,
-so a change applies on the next tick without a restart.
+a worker that is idle mid-task has to re-initialize its session. Accepted values are whole numbers
+from `60000` (one minute) to `604800000` (seven days). The value is re-read on each sweep, so a change
+applies on the next tick without a restart.
+
+The configuration API rejects values outside those ranges. A value set directly in the environment
+that is outside them, or is not a whole number, is ignored in favor of the default.
 
 Together these bound what a misbehaving client can pin: without them, a client that opens a session
 per call and never closes it keeps every one of them resident for the full idle window.
+
+The idle timeout also applies to user MCP sessions (`/mcp-user`), but the per-agent cap does not:
+user sessions are not capped.
 
 ## Task tool preloading
 

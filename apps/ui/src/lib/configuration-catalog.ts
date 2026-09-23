@@ -315,7 +315,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "MCP_MAX_SESSIONS_PER_AGENT",
         label: "Max MCP sessions per agent",
         description:
-          "MCP sessions one agent may hold, counting live sessions plus initializes still in flight. Each session pins a server instance with the whole tool registry in memory. Going over closes the least-recently-used live sessions so the active one survives; if in-flight admissions alone fill the cap, the new initialize is refused with HTTP 429. A normal worker uses one; raise this only if an agent legitimately runs many parallel MCP clients.",
+          "MCP sessions one agent may hold, counting live sessions plus initializes still in flight. Each session pins a server instance with the whole tool registry in memory. Going over closes the least-recently-used idle sessions so the active one survives; a session with a request still in progress is never closed. If in-flight admissions and busy sessions alone fill the cap, the new initialize is refused with HTTP 429. A normal worker uses one; raise this only if an agent legitimately runs many parallel MCP clients. Whole numbers from 1 to 1000. Does not apply to user MCP sessions (/mcp-user).",
         kind: "number",
         defaultValue: "16",
         docsUrl: `${DOCS}ui/configuration`,
@@ -324,7 +324,7 @@ export const CONFIGURATION_GROUPS: ConfigCatalogGroup[] = [
         key: "MCP_TRANSPORT_IDLE_TIMEOUT_MS",
         label: "MCP session idle timeout (ms)",
         description:
-          "How long an MCP session with no traffic is kept before the periodic sweep closes it and frees its server instance. Clients rarely close sessions themselves, so this is what reclaims them. Lower it to reclaim memory sooner; too low and a worker idle mid-task has to re-initialize. Default is 2 hours.",
+          "How long an MCP session with no traffic is kept before the periodic sweep closes it and frees its server instance. Clients rarely close sessions themselves, so this is what reclaims them. Lower it to reclaim memory sooner; too low and a worker idle mid-task has to re-initialize. Whole numbers from 60000 (1 minute) to 604800000 (7 days). Default is 2 hours.",
         kind: "number",
         defaultValue: "7200000",
         docsUrl: `${DOCS}ui/configuration`,

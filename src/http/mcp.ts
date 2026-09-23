@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { getAgentById, getResolvedConfig, getTaskById } from "@/be/db";
+import { MCP_SESSION_BOUNDS } from "@/be/swarm-config-guard";
 import { createServer } from "@/server";
 import { parseEnvFlag } from "@/utils/env-flag";
 import { getRequestAuth } from "@/utils/request-auth-context";
@@ -24,23 +25,40 @@ export const DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
  */
 export const DEFAULT_MCP_MAX_SESSIONS_PER_AGENT = 16;
 
-function resolvePositiveInt(raw: string | undefined, fallback: number): number {
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.floor(parsed);
+/**
+ * Whole numbers inside the key's `MCP_SESSION_BOUNDS` range, else the default.
+ * Integer-only on purpose: flooring a fraction like "0.5" would yield 0, which
+ * refuses every initialize (cap) or reaps every session on the next sweep
+ * (idle timeout). The config API rejects the same values, so a dashboard save
+ * can never land on a number this quietly replaces.
+ */
+function resolveBoundedInt(
+  key: keyof typeof MCP_SESSION_BOUNDS,
+  raw: string | undefined,
+  fallback: number,
+): number {
+  const str = raw?.trim();
+  if (!str || !/^\d+$/.test(str)) return fallback;
+  const value = Number(str);
+  const { min, max } = MCP_SESSION_BOUNDS[key];
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
 /** Read at sweep time, not module load, so a dashboard edit applies without a restart. */
 export function resolveMcpTransportIdleTimeoutMs(
   raw = process.env.MCP_TRANSPORT_IDLE_TIMEOUT_MS,
 ): number {
-  return resolvePositiveInt(raw, DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS);
+  return resolveBoundedInt(
+    "MCP_TRANSPORT_IDLE_TIMEOUT_MS",
+    raw,
+    DEFAULT_MCP_TRANSPORT_IDLE_TIMEOUT_MS,
+  );
 }
 
 export function resolveMcpMaxSessionsPerAgent(
   raw = process.env.MCP_MAX_SESSIONS_PER_AGENT,
 ): number {
-  return resolvePositiveInt(raw, DEFAULT_MCP_MAX_SESSIONS_PER_AGENT);
+  return resolveBoundedInt("MCP_MAX_SESSIONS_PER_AGENT", raw, DEFAULT_MCP_MAX_SESSIONS_PER_AGENT);
 }
 
 /**
@@ -70,6 +88,65 @@ function pendingSessionsFor(
   return pending;
 }
 
+/**
+ * POST requests still being answered, per session, keyed by registry like the
+ * pending map above. A session with one open is doing work for its client (a
+ * long `script-run`, say), so the cap must not evict it even when its activity
+ * stamp makes it the least recently used: closing it cuts the stream the
+ * result would be delivered on.
+ *
+ * Tracked on the response lifecycle, not around `handleRequest`: in SSE mode
+ * the transport returns the stream before the tool finishes and completes the
+ * response later from `send()`. Only POSTs count. A client can hold its
+ * standalone GET stream open for the life of the session, and counting that
+ * would make every such session unevictable.
+ */
+const busySessionsByRegistry = new WeakMap<
+  Record<string, StreamableHTTPServerTransport>,
+  Map<string, number>
+>();
+
+function busySessionsFor(
+  transports: Record<string, StreamableHTTPServerTransport>,
+): Map<string, number> {
+  let busy = busySessionsByRegistry.get(transports);
+  if (!busy) {
+    busy = new Map();
+    busySessionsByRegistry.set(transports, busy);
+  }
+  return busy;
+}
+
+/**
+ * Mark `sessionId` busy until `res` is finished or closed. Exported for tests.
+ *
+ * Also stamps activity when the response settles, so LRU order reflects when a
+ * long call ended rather than when it began.
+ */
+export function trackMcpSessionRequest(
+  transports: Record<string, StreamableHTTPServerTransport>,
+  sessionActivity: McpTransportActivity,
+  sessionId: string,
+  res: ServerResponse,
+): void {
+  const busy = busySessionsFor(transports);
+  busy.set(sessionId, (busy.get(sessionId) ?? 0) + 1);
+
+  let settled = false;
+  const settle = () => {
+    // `finish` and `close` both fire on a normal response; count it once.
+    if (settled) return;
+    settled = true;
+    const current = busy.get(sessionId) ?? 0;
+    if (current <= 1) busy.delete(sessionId);
+    else busy.set(sessionId, current - 1);
+    // Skip sessions already closed, so this cannot resurrect their activity row.
+    if (transports[sessionId]) markMcpTransportActivity(sessionActivity, sessionId);
+  };
+  res.once("finish", settle);
+  res.once("close", settle);
+}
+
 /** Live sessions plus in-flight admissions for one agent. Exported for tests. */
 export function countMcpSessionsForAgent(
   transports: Record<string, StreamableHTTPServerTransport>,
@@ -85,9 +162,11 @@ export function countMcpSessionsForAgent(
  * Admit one new session for `agentId`, enforcing the cap across live **and**
  * in-flight sessions, and return an idempotent release for the reservation.
  *
- * Call this before the first await of the initialize path and release it once
- * the request has finished — by then the session is either registered in
- * `transports` (and counted as live) or it failed and left nothing behind.
+ * Call this before the first await of the initialize path. Release it in the
+ * same synchronous step that registers the session in `transports` (so it is
+ * never counted as both pending and live), and again once the request has
+ * finished as the idempotent backstop for a setup that failed before
+ * registering.
  */
 export function reserveMcpSessionSlot(
   transports: Record<string, StreamableHTTPServerTransport>,
@@ -133,12 +212,16 @@ export function reserveMcpSessionSlot(
 }
 
 /**
- * Close this agent's least-recently-used sessions until it can take one more
- * without exceeding the cap. Returns how many were closed.
+ * Close this agent's least-recently-used idle sessions until it can take one
+ * more without exceeding the cap. Returns how many were closed.
  *
  * LRU rather than newest-first: the session a client is actively using is the
  * one it just touched, so evicting the oldest keeps a legitimate long-running
  * worker alive and sheds the abandoned ones a runaway client left behind.
+ * Sessions with a POST still being answered are never evicted (see
+ * `busySessionsByRegistry`); they still count against the cap, so when they
+ * alone keep the agent at it, nothing is closed and the caller refuses the new
+ * session instead.
  *
  * `reserved` is how many admissions for this agent are already in flight and
  * not yet in `transports`. They count against the cap, so a concurrent burst
@@ -161,20 +244,23 @@ export function enforceMcpSessionCapForAgent(
   const now = options.now ?? Date.now();
   const reserved = options.reserved ?? 0;
 
-  const owned = Object.keys(transports)
-    .filter((id) => sessionAgents[id] === agentId)
-    // Unknown activity sorts oldest: it is a session we never saw touched.
-    .sort((a, b) => (sessionActivity[a] ?? 0) - (sessionActivity[b] ?? 0));
+  const owned = Object.keys(transports).filter((id) => sessionAgents[id] === agentId);
 
   // Leave room for the session about to be created, and for the ones already
   // admitted but not yet registered. When in-flight admissions alone fill the
-  // cap this evicts every live session: the resident total is what we bound,
-  // and a burst that large has no "actively used" session to protect anyway.
+  // cap this evicts every idle live session: the resident total is what we
+  // bound, and only a session mid-request has anything left to protect.
   const excess = owned.length - (cap - 1 - reserved);
   if (excess <= 0) return 0;
 
+  const busy = busySessionsFor(transports);
+  const evictable = owned
+    .filter((id) => !busy.has(id))
+    // Unknown activity sorts oldest: it is a session we never saw touched.
+    .sort((a, b) => (sessionActivity[a] ?? 0) - (sessionActivity[b] ?? 0));
+
   let closed = 0;
-  for (const id of owned.slice(0, excess)) {
+  for (const id of evictable.slice(0, excess)) {
     const transport = transports[id];
     try {
       void transport?.close();
@@ -360,6 +446,7 @@ export async function handleMcp(
       if (sessionId && transports[sessionId]) {
         transport = transports[sessionId];
         markMcpTransportActivity(sessionActivity, sessionId);
+        trackMcpSessionRequest(transports, sessionActivity, sessionId, res);
       } else if (!sessionId && isInitializeRequest(body)) {
         const agentId = await requireKnownAgent(req, res);
         if (agentId === true) return true;
@@ -394,9 +481,19 @@ export async function handleMcp(
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id) => {
+            // Hand the reservation over to the live entry in one synchronous
+            // step. Releasing only in the `finally` below would leave the
+            // session counted as both pending and live until its initialize
+            // response is written, and a concurrent initialize for this agent
+            // could evict or refuse on that double count. The `finally` call
+            // stays as the idempotent release for paths that never get here.
+            releaseSessionSlot?.();
             transports[id] = transport;
             sessionAgents[id] = agentId;
             markMcpTransportActivity(sessionActivity, id);
+            // The initialize response is still being written; keep the new
+            // session out of eviction until it is.
+            trackMcpSessionRequest(transports, sessionActivity, id, res);
           },
           onsessionclosed: (id) => {
             delete transports[id];
