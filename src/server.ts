@@ -288,6 +288,32 @@ export function isScriptsOnlyMcp(): boolean {
   return resolveScriptsOnlyMode({ env: process.env.SCRIPTS_ONLY_MCP });
 }
 
+/**
+ * One-shot latches for the boot-scale seeding inside `createServer()`. `initDb()`
+ * already self-guards and `startPricingRefreshLoop()` /
+ * `registerGithubTaskReactions()` use the same pattern; the pricing and RBAC
+ * seeds were the two that still re-ran on every MCP session.
+ *
+ * `createServer()` is not the only seeding path: the HTTP server seeds both at
+ * boot in `src/http/index.ts`, so an API process does one redundant seed on its
+ * first MCP session and none after. The stdio transport (`src/stdio.ts`) has no
+ * other path, which is why the calls stay here rather than moving to boot.
+ *
+ * Keyed to the process, not to the DB handle: a test that swaps the DB
+ * in-process (`globalThis.__testMigrationTemplate`) and calls `createServer()`
+ * again would get an unseeded DB. Reset the latches if you ever need that.
+ */
+let pricingSeedApplied = false;
+/**
+ * Separate from the pricing latch and set only after a sync that SUCCEEDED.
+ * With RBAC off a failed sync is logged and swallowed; latching it anyway would
+ * make every later `createServer()` skip the sync, so flipping the live-reloadable
+ * `RBAC_ENABLED` on afterwards would hand out servers over a broken role catalog
+ * instead of failing closed. The cost: RBAC off plus a broken catalog retries the
+ * sync on every session, which is what every session did before the latch.
+ */
+let rbacSeedsSynced = false;
+
 export async function createServer(
   opts: { scriptsOnly?: boolean; fullSurface?: boolean; preloadedTools?: readonly string[] } = {},
 ) {
@@ -306,19 +332,35 @@ export async function createServer(
   initDb(process.env.DATABASE_PATH);
 
   // Phase 2: project the vendored models.dev snapshot into the pricing table.
-  // Idempotent (INSERT OR IGNORE keyed on PK with effective_from=0); safe to
-  // call on every boot. See src/be/seed-pricing.ts for the projection logic
-  // and the manual-override constants for runtime-fee / ACU pricing.
-  seedPricingFromModelsDev();
+  // Idempotent (INSERT OR IGNORE keyed on PK with effective_from=0). Guarded to
+  // run once per process, like startPricingRefreshLoop below: createServer()
+  // runs once per MCP session, not once per boot, and this is boot-scale work —
+  // an 8 MiB snapshot parse plus a 3121-statement BEGIN IMMEDIATE transaction.
+  // Repeating it per session bought nothing ("0 new row(s)" every time) and on
+  // 2026-09-22 it drove both the heap blowup and ~5 write-lock acquisitions/s
+  // under a client that opened ~940 sessions in 3 minutes.
+  // startPricingRefreshLoop() owns live price updates from here on.
+  // See src/be/seed-pricing.ts for the projection logic and the manual-override
+  // constants for runtime-fee / ACU pricing.
+  if (!pricingSeedApplied) {
+    seedPricingFromModelsDev();
+    pricingSeedApplied = true;
+  }
   startPricingRefreshLoop();
 
-  try {
-    ensureRbacSeedsSynced();
-  } catch (err) {
-    console.error("[startup] Failed to sync RBAC seed rows:", err);
-    // RBAC flag-on must fail closed; flag-off deployments should not be bricked
-    // by role-catalog drift for a disabled security feature.
-    if (isRbacEnabled()) throw err;
+  // Same reasoning: boot-scale, idempotent, and re-run per MCP session before.
+  // Fail-closed is preserved: the latch is set only on success, so a failed sync
+  // is retried by the next call whether or not RBAC was on when it failed.
+  if (!rbacSeedsSynced) {
+    try {
+      ensureRbacSeedsSynced();
+      rbacSeedsSynced = true;
+    } catch (err) {
+      console.error("[startup] Failed to sync RBAC seed rows:", err);
+      // RBAC flag-on must fail closed; flag-off deployments should not be bricked
+      // by role-catalog drift for a disabled security feature.
+      if (isRbacEnabled()) throw err;
+    }
   }
 
   // Subscribe API-side integrations to task-lifecycle events. Idempotent.
