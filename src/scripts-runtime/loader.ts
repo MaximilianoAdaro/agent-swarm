@@ -1,3 +1,5 @@
+import { getAgentById } from "../be/db";
+import { mintScriptRunToken, revokeSessionToken } from "../be/users";
 import { getApiKey } from "../utils/api-key";
 import { getMcpBaseUrl } from "../utils/constants";
 import { type EgressPolicy, parseEgressAllowlist } from "../utils/egress-guard";
@@ -73,10 +75,50 @@ export function scriptEgressPolicy(env: NodeJS.ProcessEnv = process.env): Egress
   };
 }
 
-async function buildConfigPayload(input: RunScriptInput): Promise<SwarmConfigPayload> {
+/**
+ * Backstop lifetime of a script run's api credential. The run revokes its
+ * token the moment it ends (see `runScript`); this bounds a token whose run
+ * died without releasing. Comfortably above the default script wall clock.
+ */
+const SCRIPT_RUN_TOKEN_TTL_MS = 15 * 60 * 1000;
+
+export type ScriptApiCredential = {
+  /** The bearer the script's `ctx.swarm` SDK calls present to the api. */
+  apiKey: string;
+  /** Revoke the per-run token, if one was minted. Safe to call once. */
+  release: () => Promise<void>;
+};
+
+/**
+ * Resolve the api credential a script run acts as. When the run has a real
+ * executing agent, mint a short-lived token bound to it so `ctx.swarm` calls
+ * are scoped to that agent at the api, instead of carrying the swarm API key
+ * (the operator). System runs with no real agent — scheduler and workflow
+ * runs pass sentinel ids like "schedule"/"workflow" — keep the operator key,
+ * their existing behavior. The caller must `release()` when the run ends.
+ */
+export async function acquireScriptApiCredential(agentId: string): Promise<ScriptApiCredential> {
+  if (await getAgentById(agentId)) {
+    const token = await mintScriptRunToken(agentId, SCRIPT_RUN_TOKEN_TTL_MS);
+    let released = false;
+    return {
+      apiKey: token.plaintext,
+      release: async () => {
+        if (released) return;
+        released = true;
+        await revokeSessionToken(token.tokenId);
+      },
+    };
+  }
   const apiKey = getApiKey();
   if (!apiKey) throw new Error("Swarm API key is required to run scripts");
+  return { apiKey, release: async () => {} };
+}
 
+async function buildConfigPayload(
+  input: RunScriptInput,
+  apiKey: string,
+): Promise<SwarmConfigPayload> {
   return {
     system: {
       apiKey: { value: apiKey, isSecret: true },
@@ -139,22 +181,31 @@ export async function runScript(input: RunScriptInput): Promise<RunScriptOutput>
     ...(input.timeoutMs ? { wallClockMs: input.timeoutMs } : {}),
   };
 
-  const configPayload = await buildConfigPayload(input);
-  const executorInput = {
-    source: input.source,
-    args: input.args ?? null,
-    configPayload,
-    resources,
-    fsMode: input.fsMode ?? "none",
-    network: scriptEgressPolicy(),
-    signal: input.signal,
-  };
+  // Scope the run's ctx.swarm SDK calls to the executing agent instead of the
+  // operator key, and revoke that credential the moment the run ends — on
+  // success, failure or abort.
+  const credential = await acquireScriptApiCredential(input.agentId);
+  let output: ExecutorOutput;
+  try {
+    const configPayload = await buildConfigPayload(input, credential.apiKey);
+    const executorInput = {
+      source: input.source,
+      args: input.args ?? null,
+      configPayload,
+      resources,
+      fsMode: input.fsMode ?? "none",
+      network: scriptEgressPolicy(),
+      signal: input.signal,
+    };
 
-  let output = await getScriptExecutor().run(executorInput);
-  for (const delayMs of CAPACITY_EXCEEDED_RETRY_DELAYS_MS) {
-    if (output.error !== "capacity_exceeded" || input.signal?.aborted) break;
-    await Bun.sleep(delayMs);
     output = await getScriptExecutor().run(executorInput);
+    for (const delayMs of CAPACITY_EXCEEDED_RETRY_DELAYS_MS) {
+      if (output.error !== "capacity_exceeded" || input.signal?.aborted) break;
+      await Bun.sleep(delayMs);
+      output = await getScriptExecutor().run(executorInput);
+    }
+  } finally {
+    await credential.release();
   }
 
   return {
