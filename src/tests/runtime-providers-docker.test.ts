@@ -310,6 +310,7 @@ describe("Docker runtime provider", () => {
     await provider.terminate(target, handle);
     expect(calls[0]?.init.method).toBe("DELETE");
     expect(calls[0]?.url.searchParams.get("force")).toBe("true");
+    expect(calls[0]?.url.searchParams.get("v")).toBe("true");
   });
 
   test("termination succeeds when the container is already absent", async () => {
@@ -376,6 +377,7 @@ describe("Docker runtime provider", () => {
         "DELETE /v1.47/containers/container-1",
       ]);
       expect(calls[2]?.url.searchParams.get("force")).toBe("true");
+      expect(calls[2]?.url.searchParams.get("v")).toBe("true");
     }
   });
 

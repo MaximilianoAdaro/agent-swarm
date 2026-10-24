@@ -177,7 +177,9 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       try {
         await dockerApi(target, "POST", `/containers/${created.Id}/start`);
       } catch (err) {
-        await dockerApi(target, "DELETE", `/containers/${created.Id}?force=true`).catch(() => {});
+        await dockerApi(target, "DELETE", `/containers/${created.Id}?force=true&v=true`).catch(
+          () => {},
+        );
         throw err;
       }
       return { kind: "docker", externalId: created.Id };
@@ -188,7 +190,9 @@ export class DockerRuntimeProvider implements RuntimeProvider {
 
   async terminate(target: RuntimeTargetConfig, handle: RuntimeHandle): Promise<void> {
     try {
-      await dockerApi(target, "DELETE", `/containers/${handle.externalId}?force=true`);
+      // v=true also removes the container's anonymous volumes (the worker image declares
+      // VOLUME /logs); named volumes are never removed by it.
+      await dockerApi(target, "DELETE", `/containers/${handle.externalId}?force=true&v=true`);
     } catch (err) {
       if (!(err instanceof DockerApiError) || err.statusCode !== 404) throw err;
     }
