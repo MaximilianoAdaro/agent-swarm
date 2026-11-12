@@ -429,6 +429,9 @@ export function bootIdentityBaselines(
   if (setupContent) baselines.setupScript = contentSha256(setupContent);
   baselines.expected = {};
   for (const field of CAS_FIELDS) baselines.expected[field] = contentSha256(dbProfile[field] ?? "");
+  // The DB value /workspace/CLAUDE.md derives from: a non-Claude session's sync
+  // sends it as the token, so an apply made while the session ran is not undone.
+  baselines.expected.claudeMd = contentSha256(dbProfile.claudeMd ?? "");
   return baselines;
 }
 
@@ -1004,6 +1007,18 @@ export async function collectProfilePayloads(
           (baselines?.claudeMd ? { written: null, base: baselines.claudeMd } : null);
         const body = planClaudeMdSync({ content: raw, record });
         if (body) payloads.push({ label: "claude", body });
+      } else if (claudeMdPath === WORKSPACE_CLAUDE_MD_PATH) {
+        // Non-Claude sessions edit the workspace copy the runner wrote at boot.
+        // Without the token an older copy overwrote a later apply (agent-swarm-ops#452).
+        const token = baselines?.expected?.claudeMd;
+        if (!uploadsHeld && token) {
+          payloads.push({
+            label: "claude",
+            body: { claudeMd: raw, changeSource, expectedHashes: { claudeMd: token } },
+          });
+        } else {
+          console.warn(`[profile-sync] ${claudeMdPath} held: no boot token for claudeMd`);
+        }
       } else {
         payloads.push({ label: "claude", body: { claudeMd: raw, changeSource } });
       }
@@ -1143,6 +1158,30 @@ async function settleProfileUpdate(
 }
 
 /**
+ * Advance the workspace CLAUDE.md token once the DB holds what was sent. HTTP
+ * 2xx alone is not acceptance: on a conflict the route returns the DB value.
+ */
+async function settleClaudeMdToken(
+  sentToken: string,
+  sent: string,
+  stored: unknown,
+  io: ProfileFileIO,
+): Promise<void> {
+  if (!stored || typeof stored !== "object" || (stored as Agent).claudeMd !== sent) return;
+  const locked = await withFileLock(
+    io.baselinesLockPath ?? IDENTITY_BASELINES_LOCK_PATH,
+    async () => {
+      const baselines = await readIdentityBaselines(io.readFile);
+      if (baselines?.expected?.claudeMd !== sentToken) return;
+      baselines.expected.claudeMd = contentSha256(sent);
+      await io.writeFile(IDENTITY_BASELINES_PATH, JSON.stringify(baselines));
+    },
+    { waitMs: BASELINES_LOCK_WAIT_MS },
+  );
+  if (!locked.acquired) console.warn(`[profile-sync] claudeMd not settled: lock ${locked.reason}`);
+}
+
+/**
  * Sync the agent's local profile files back to the API. Reads SOUL/IDENTITY/
  * TOOLS/HEARTBEAT/CLAUDE.md + the agent-managed section of start-up.sh and
  * POSTs each changed group. Idempotent server-side: the profile route only
@@ -1185,6 +1224,9 @@ export async function syncProfileFilesToServer(opts: ProfileSyncOptions): Promis
         // Keep #2600's workspace CLAUDE.md advancement; the personal file is
         // still owned by the separate CLAUDE.md lineage lock below.
         await advanceIdentityBaselines({ claudeMd: payload.body.claudeMd }, io);
+        const token = (payload.body.expectedHashes as ProfileExpectedHashes | undefined)?.claudeMd;
+        if (token)
+          await settleClaudeMdToken(token, payload.body.claudeMd, await response.json(), io);
       } else {
         const stored: unknown = await response.json();
         if (stored && typeof stored === "object" && !Array.isArray(stored)) {
