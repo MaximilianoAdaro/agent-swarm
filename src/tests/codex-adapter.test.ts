@@ -37,6 +37,7 @@ import {
 } from "../providers/codex-models";
 import type { ProviderEvent, ProviderResult, ProviderSessionConfig } from "../providers/types";
 import { isCodexAuthFailureReason } from "../utils/codex-auth-failure";
+import { clearVolatileSecretsForTesting, registerVolatileSecret } from "../utils/secret-scrubber";
 import { makeFakeAppServer } from "./fixtures/codex-app-server-client";
 import { HELD_NOTE_TEXT, holdTemplateRender } from "./fixtures/held-template-render";
 
@@ -1100,6 +1101,76 @@ describe("CodexSession event mapping", () => {
     if (toolEnd && toolEnd.type === "tool_end") {
       expect(toolEnd.toolCallId).toBe("cmd-1");
       expect(toolEnd.toolName).toBe("bash");
+    }
+  });
+
+  // agent-swarm-ops#1177: el `raw_log` lleva el evento doblemente codificado.
+  // Una comilla simple sin cerrar tras `GITHUB_TOKEN=` hacía que el scrubber se
+  // comiera el `\\n` y el `"` de cierre, y `emit` moría con `Unterminated string`.
+  const LINE_87 = "  - `grep -c '^GITHUB_TOKEN='` sobre su env da `0`.";
+  const runSedOutput = (aggregatedOutput: string, name: string) => {
+    const cmdItem: CommandExecutionItem = {
+      id: "cmd-sed",
+      type: "command_execution",
+      command: "sed -n '1,105p' body.md; sed -n '1,110p' diff.txt",
+      aggregated_output: aggregatedOutput,
+      exit_code: 0,
+      status: "completed",
+    };
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thread-sed" },
+      { type: "turn.started" },
+      { type: "item.started", item: cmdItem as ThreadItem },
+      { type: "item.completed", item: cmdItem as ThreadItem },
+      {
+        type: "turn.completed",
+        usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5 },
+      },
+    ];
+    return runSessionWithFakeThread(
+      events,
+      testConfig({ logFile: join(tmpLogDir, `${name}.log`), cwd: "" }),
+    );
+  };
+
+  test("command output with an unclosed quoted assignment keeps the session alive", async () => {
+    const { emitted, result } = await runSedOutput(
+      ["## Verificación", "", LINE_87, '  - el log dice "ok" y sigue', "mas"].join("\n"),
+      "unclosed-quote",
+    );
+
+    expect(result.failureReason ?? "").not.toContain("Unterminated string");
+    const toolEnd = emitted.find((e) => e.type === "tool_end");
+    expect(JSON.stringify(toolEnd)).toContain("mas");
+    expect(emitted.some((e) => e.type === "result")).toBe(true);
+  });
+
+  test("an unclosed quote does not swallow a later secret assignment", async () => {
+    const secret = `s3cr3t-${"x".repeat(24)}`;
+    const { emitted } = await runSedOutput(
+      [LINE_87, '  - el log dice "ok" y sigue', `GITHUB_TOKEN='${secret}`, "mas"].join("\n"),
+      "unclosed-quote-secret",
+    );
+
+    expect(JSON.stringify(emitted)).not.toContain(secret);
+    expect(JSON.stringify(emitted)).toContain("[REDACTED:GITHUB_TOKEN]");
+    expect(emitted.some((e) => e.type === "result")).toBe(true);
+  });
+
+  // Si aun así el texto scrubbeado deja de ser JSON (acá, un secreto conocido que
+  // abarca `","` entre dos campos), `emit` no puede tumbar la sesión.
+  test("an event whose scrubbed JSON no longer parses does not end the session", async () => {
+    const secret = 'diff.txt","aggregated_output';
+    registerVolatileSecret(secret, "probe_secret");
+    try {
+      const { emitted, result } = await runSedOutput("total 0", "unparseable-scrub");
+
+      expect(result.failureReason ?? "").not.toContain("JSON Parse error");
+      expect(emitted.some((e) => e.type === "result")).toBe(true);
+      expect(JSON.stringify(emitted)).toContain("[REDACTED:probe_secret]");
+      expect(JSON.stringify(emitted)).not.toContain(JSON.stringify(secret).slice(1, -1));
+    } finally {
+      clearVolatileSecretsForTesting();
     }
   });
 

@@ -252,9 +252,19 @@ function escapedForms(value: string): string[] {
 // multi-line value in an env dump does. An unterminated quote (or one whose
 // close sits mid-line further down) stops at the first newline, raw or JSON
 // `\n`, so it never swallows the rest of the text.
+//
+// The value cut at the end of the line (`openItem`) must also stop before a
+// `"` that would end the JSON string the text sits in: consuming it left the
+// JSON that codex's `emit` parses back unterminated (agent-swarm-ops#1177).
 const QUOTE_EOL = String.raw`(?=$|[\r\n]|\\[rn]|")`;
-function quoted(open: string, close: string, item: string, lineItem: string): string {
-  return `${open}(?:(?:${lineItem})*${close}|(?:${item})*${close}${QUOTE_EOL}|(?:${lineItem})*)`;
+function quoted(
+  open: string,
+  close: string,
+  item: string,
+  lineItem: string,
+  openItem = lineItem,
+): string {
+  return `${open}(?:(?:${lineItem})*${close}|(?:${item})*${close}${QUOTE_EOL}|(?:${openItem})*)`;
 }
 const JSON_DQ = quoted(
   String.raw`\\"(?!\$)`,
@@ -272,7 +282,11 @@ const SQ = quoted(
   `'`,
   `'`,
   String.raw`[^'\\]|'\\\\?''|\\[\s\S]`,
-  String.raw`[^'\\\r\n]|'\\\\?''|\\[^nr\r\n]`,
+  // A backslash run is read whole, so the `\\n` of a JSON string serialized
+  // twice ends the line too, instead of its first `\\` passing as an escape.
+  String.raw`[^'\\\r\n]|'\\\\?''|(?:\\\\)*\\[^\\nr\r\n]|(?:\\\\)+(?=[^\\nr\r\n])`,
+  // A `"` after an even run (none included) is unescaped: it ends the string.
+  String.raw`[^'"\\\r\n]|'\\\\?''|(?:\\\\)*\\[^\\nr\r\n]|(?:\\\\)+(?=[^\\"nr\r\n])`,
 );
 const BARE = String.raw`(?!\$)(?:\\[^nrtu"\s]|[^\s"'\\])+`;
 

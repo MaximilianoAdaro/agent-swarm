@@ -110,6 +110,23 @@ export { buildPoolRevalidationFailureReason } from "./codex-oauth/storage.js";
 
 type CodexConfig = Record<string, CodexConfigValue | undefined>;
 
+/**
+ * Scrub a whole event at the egress boundary. The text pass runs on the
+ * serialized event so key-context rules (`"password":"…"`) still apply, but a
+ * redaction that spans JSON syntax can leave text `JSON.parse` rejects
+ * (agent-swarm-ops#1177). Then the event becomes its scrubbed text as a
+ * `raw_stderr`, as `handleLine` does with a non-JSON line, instead of throwing
+ * out of `emit` and ending the session.
+ */
+function scrubProviderEvent(event: ProviderEvent): ProviderEvent {
+  const scrubbed = scrubSecrets(JSON.stringify(event));
+  try {
+    return JSON.parse(scrubbed) as ProviderEvent;
+  } catch {
+    return { type: "raw_stderr", content: `${scrubbed}\n` };
+  }
+}
+
 /** `model_provider` id of the generated gateway block. */
 const CODEX_GATEWAY_PROVIDER_ID = "swarm-gateway";
 
@@ -1232,7 +1249,7 @@ export class CodexSession implements ProviderSession {
   private emit(event: ProviderEvent): void {
     // App-server item payloads can carry tool arguments and model errors.
     // Scrub the complete event at the log and listener egress boundary.
-    const scrubbed = JSON.parse(scrubSecrets(JSON.stringify(event))) as ProviderEvent;
+    const scrubbed = scrubProviderEvent(event);
     try {
       this.logFileHandle.write(
         `${JSON.stringify({ ...scrubbed, timestamp: new Date().toISOString() })}\n`,
@@ -2441,7 +2458,7 @@ class CodexSubprocessSession implements ProviderSession {
   }
 
   private emit(event: ProviderEvent): void {
-    event = JSON.parse(scrubSecrets(JSON.stringify(event))) as ProviderEvent;
+    event = scrubProviderEvent(event);
     if (event.type === "session_init" && event.sessionId) {
       this._sessionId = event.sessionId;
     }

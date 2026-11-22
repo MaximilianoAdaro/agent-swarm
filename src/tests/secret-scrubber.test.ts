@@ -351,6 +351,50 @@ describe("scrubSecrets — regex patterns", () => {
   });
 });
 
+// agent-swarm-ops#1177: codex `emit` hace JSON.parse(scrubSecrets(JSON.stringify(event)))
+// y el `raw_log` lleva el evento serializado dos veces. Una comilla simple sin
+// cerrar no puede comerse ni el salto de línea de ningún nivel ni el `"` externo.
+describe("scrubSecrets — an unclosed quoted value keeps JSON parseable", () => {
+  const LINE_87 = "  - `grep -c '^GITHUB_TOKEN='` sobre su env da `0`.";
+  const rawLog = (output: string) =>
+    JSON.stringify({
+      type: "raw_log",
+      content: JSON.stringify({
+        type: "item.completed",
+        item: { id: "c1", type: "command_execution", aggregated_output: output },
+      }),
+    });
+
+  test("double-encoded raw_log with the unclosed quote and a following line", () => {
+    const out = scrubSecrets(rawLog(`${LINE_87}\nmas`));
+    const parsed = JSON.parse(out) as { content: string };
+    const inner = JSON.parse(parsed.content) as { item: { aggregated_output: string } };
+    expect(inner.item.aggregated_output).toEndWith("\nmas");
+  });
+
+  test("single-encoded value ending in the unclosed quote", () => {
+    const out = scrubSecrets(JSON.stringify({ content: LINE_87 }));
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+
+  test("an unclosed or closed secret is still redacted at every encoding level", () => {
+    const secret = `s3cr3t-${randomToken(24)}`;
+    for (const text of [
+      `GITHUB_TOKEN='${secret}\nmas`,
+      `GITHUB_TOKEN='${secret}' mas`,
+      `GITHUB_TOKEN='${secret}"x' mas`,
+    ]) {
+      for (const encoded of [text, JSON.stringify({ content: text }), rawLog(text)]) {
+        const out = scrubSecrets(encoded);
+        expect(out).not.toContain(secret);
+        expect(out).toContain("[REDACTED:GITHUB_TOKEN]");
+        expect(out).toContain("mas");
+        if (encoded !== text) expect(() => JSON.parse(out)).not.toThrow();
+      }
+    }
+  });
+});
+
 describe("scrubSecrets — does not over-scrub", () => {
   test("the word 'token' in prose is not redacted", () => {
     const s = "Please provide your access token in the Authorization header.";
