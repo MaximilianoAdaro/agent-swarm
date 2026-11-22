@@ -263,14 +263,29 @@ function quoted(
   item: string,
   lineItem: string,
   openItem = lineItem,
+  eol = QUOTE_EOL,
 ): string {
-  return `${open}(?:(?:${lineItem})*${close}|(?:${item})*${close}${QUOTE_EOL}|(?:${openItem})*)`;
+  return `${open}(?:(?:${lineItem})*${close}|(?:${item})*${close}${eol}|(?:${openItem})*)`;
 }
 const JSON_DQ = quoted(
   String.raw`\\"(?!\$)`,
   String.raw`\\"`,
   String.raw`\\\\(?:\\\\|\\"|[^\\"])|\\[^\\"]|[^"\\]`,
   String.raw`\\\\(?:\\\\|\\"|[^\\"\r\n])|\\[^\\"nr\r\n]|[^"\\\r\n]`,
+);
+// JSON2_DQ: the same shell `"…"` one JSON level deeper (codex's `raw_log`
+// carries the event serialized twice), where the quote arrives as `\\\"`.
+// Each backslash run is read whole: a run of 4k+3 before `"` is a quote the
+// shell escaped (`\"`), shorter runs before `"` end a JSON string and are
+// never taken, and a run of 1 or 2 before `n`/`r` is a line break of one
+// level or the other (agent-swarm-ops#1177).
+const JSON2_DQ = quoted(
+  String.raw`\\\\\\"(?!\$)`,
+  String.raw`\\\\\\"`,
+  String.raw`[^"\\]|\\+[^\\"]|(?:\\\\\\\\)+\\\\\\"`,
+  String.raw`[^"\\\r\n]|\\+[^\\"nr\r\n]|(?:\\\\\\\\)+(?:[nr]|\\\\\\")`,
+  undefined,
+  String.raw`(?=$|[\r\n]|\\{1,2}[rn]|\\?")`,
 );
 const RAW_DQ = quoted(
   `"(?!\\$)`,
@@ -301,7 +316,7 @@ const BARE = String.raw`(?!\$)(?:\\[^nrtu"\s]|[^\s"'\\])+`;
  * (INI_ASSIGNMENT_RE).
  */
 const ASSIGNMENT_RE = new RegExp(
-  String.raw`(?:(?<=\\[nrt])|(?<![\w\\.]))([A-Za-z_][A-Za-z0-9_.]*)=(?!=)(${JSON_DQ}|${RAW_DQ}|${SQ}|${BARE})`,
+  String.raw`(?:(?<=\\[nrt])|(?<![\w\\.]))([A-Za-z_][A-Za-z0-9_.]*)=(?!=)(${JSON_DQ}|${JSON2_DQ}|${RAW_DQ}|${SQ}|${BARE})`,
   "g",
 );
 
@@ -316,7 +331,7 @@ function redactAssignment(match: string, key: string, value: string): string {
   if (!isSensitiveKeyPath(key)) return match;
   let open = "";
   let close = "";
-  for (const quote of ['\\"', '"', "'"]) {
+  for (const quote of ['\\\\\\"', '\\"', '"', "'"]) {
     if (!value.startsWith(quote)) continue;
     open = quote;
     if (value.length >= quote.length * 2 && value.endsWith(quote)) close = quote;

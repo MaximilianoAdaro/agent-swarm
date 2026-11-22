@@ -1157,6 +1157,21 @@ describe("CodexSession event mapping", () => {
     expect(emitted.some((e) => e.type === "result")).toBe(true);
   });
 
+  // En el `raw_log` el `"` del shell llega como `\\\"` y el valor salía sin redactar.
+  test("a double-quoted secret assignment does not reach the emitted raw_log", async () => {
+    const secret = `s3cr3t-${"y".repeat(24)}`;
+    const { emitted } = await runSedOutput(
+      [`export GITHUB_TOKEN="${secret}"`, "mas"].join("\n"),
+      "double-quoted-secret",
+    );
+
+    const rawLogs = emitted.filter((e) => e.type === "raw_log");
+    expect(rawLogs.length).toBeGreaterThan(0);
+    expect(JSON.stringify(rawLogs)).not.toContain(secret);
+    expect(JSON.stringify(emitted)).not.toContain(secret);
+    expect(emitted.some((e) => e.type === "result")).toBe(true);
+  });
+
   // Si aun así el texto scrubbeado deja de ser JSON (acá, un secreto conocido que
   // abarca `","` entre dos campos), `emit` no puede tumbar la sesión.
   test("an event whose scrubbed JSON no longer parses does not end the session", async () => {

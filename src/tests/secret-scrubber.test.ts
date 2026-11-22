@@ -393,6 +393,48 @@ describe("scrubSecrets — an unclosed quoted value keeps JSON parseable", () =>
       }
     }
   });
+
+  // En el segundo nivel el `"` del shell llega como `\\\"`: `JSON_DQ` sólo abre
+  // con `\"`, así que `BARE` se quedaba con el `\\` inicial y el secreto salía.
+  const decodedOutput = (out: string) => {
+    const parsed = JSON.parse(out) as { content: string };
+    return (JSON.parse(parsed.content) as { item: { aggregated_output: string } }).item
+      .aggregated_output;
+  };
+
+  test("a double-quoted value in a double-encoded raw_log is redacted whole", () => {
+    const secret = `s3cr3t-${randomToken(24)}`;
+    const out = scrubSecrets(rawLog(`export GITHUB_TOKEN="${secret}"\nmas`));
+    expect(out).not.toContain(secret);
+    expect(decodedOutput(out)).toBe(`export GITHUB_TOKEN="[REDACTED:GITHUB_TOKEN]"\nmas`);
+  });
+
+  test("an unclosed double quote in a double-encoded raw_log stops at the line end", () => {
+    const secret = `s3cr3t-${randomToken(24)}`;
+    const later = `l4t3r-${randomToken(24)}`;
+    const out = scrubSecrets(
+      rawLog(`export GITHUB_TOKEN="${secret}\nmas\nexport GITHUB_TOKEN="${later}"`),
+    );
+    expect(out).not.toContain(secret);
+    expect(out).not.toContain(later);
+    expect(decodedOutput(out)).toBe(
+      `export GITHUB_TOKEN="[REDACTED:GITHUB_TOKEN]\nmas\nexport GITHUB_TOKEN="[REDACTED:GITHUB_TOKEN]"`,
+    );
+  });
+
+  test("a double-encoded double-quoted value keeps its escaped quotes and the JSON", () => {
+    const head = `s3cr3t-${randomToken(24)}`;
+    const tail = `t41l-${randomToken(24)}`;
+    for (const [text, expected] of [
+      [`GITHUB_TOKEN="${head}\\"${tail}" mas`, `GITHUB_TOKEN="[REDACTED:GITHUB_TOKEN]" mas`],
+      [`x GITHUB_TOKEN="${head}\\"${tail}`, `x GITHUB_TOKEN="[REDACTED:GITHUB_TOKEN]`],
+    ] as const) {
+      const out = scrubSecrets(rawLog(text));
+      expect(out).not.toContain(head);
+      expect(out).not.toContain(tail);
+      expect(decodedOutput(out)).toBe(expected);
+    }
+  });
 });
 
 describe("scrubSecrets — does not over-scrub", () => {
