@@ -9,6 +9,7 @@ import {
   registerSensitiveKeyName,
   registerVolatileSecret,
   SCRUBBER_RULES_VERSION,
+  scrubJson,
   scrubObject,
   scrubSecrets,
   unregisterVolatileSecret,
@@ -1064,5 +1065,58 @@ describe("createValueScrubber (per-run exact values)", () => {
     expect(scrub.text("unchanged")).toBe("unchanged");
     const obj = { a: 1 };
     expect(scrub.object(obj)).toBe(obj);
+  });
+});
+
+// agent-swarm-ops#1177: a command output with an unclosed `KEY='` (here a
+// `grep -c '^GITHUB_TOKEN='` in a markdown line) made the key pass run past the
+// JSON string, so `JSON.parse(scrubSecrets(JSON.stringify(event)))` threw
+// "Unterminated string" inside the codex adapter's emit and killed the task.
+describe("scrubJson", () => {
+  const line = "  - `grep -c '^GITHUB_TOKEN='` sobre su env da `0`.";
+
+  test("the serialized scrub breaks on an unclosed KEY=' inside a string", () => {
+    expect(() => JSON.parse(scrubSecrets(JSON.stringify({ result: line })))).toThrow();
+  });
+
+  test("keeps the shape of an event whose string holds an unclosed KEY='", () => {
+    const event = { type: "tool_end", toolCallId: "exec-1", result: line };
+    const out = scrubJson(event);
+    expect(out.type).toBe("tool_end");
+    expect(out.toolCallId).toBe("exec-1");
+    expect(typeof out.result).toBe("string");
+    expect(out.result.startsWith("  - `grep -c '^GITHUB_TOKEN='")).toBe(true);
+  });
+
+  test("keeps the shape when the line arrives double-encoded in a raw_log", () => {
+    const inner = {
+      type: "item.completed",
+      item: { type: "command_execution", aggregated_output: `a\n${line}\nb` },
+    };
+    const out = scrubJson({ type: "raw_log", content: JSON.stringify(inner) });
+    expect(out.type).toBe("raw_log");
+    expect(typeof out.content).toBe("string");
+  });
+
+  test("still redacts a known value in the fallback path", () => {
+    const value = `example-${randomToken(32)}`;
+    process.env.SCRUB_JSON_TOKEN = value;
+    refreshSecretScrubberCache();
+    const out = scrubJson({ result: line, other: `leak ${value} here` });
+    expect(out.other).toBe("leak [REDACTED:SCRUB_JSON_TOKEN] here");
+    expect(JSON.stringify(out)).not.toContain(value);
+  });
+
+  test("matches the serialized scrub when that one parses", () => {
+    const github = ["ghp", randomToken(36)].join("_");
+    const event = { type: "raw_stderr", content: `Authorization: Bearer ${github}\n` };
+    expect(scrubJson(event)).toEqual(JSON.parse(scrubSecrets(JSON.stringify(event))));
+    expect(JSON.stringify(scrubJson(event))).not.toContain(github);
+  });
+
+  test("passes undefined and primitives through", () => {
+    expect(scrubJson(undefined)).toBeUndefined();
+    expect(scrubJson(null)).toBeNull();
+    expect(scrubJson(3)).toBe(3);
   });
 });
